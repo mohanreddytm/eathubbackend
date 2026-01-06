@@ -1,0 +1,35 @@
+###
+
+POST http://localhost:8000/addNewOrder
+Content-Type: application/json
+
+{
+    "id":"one",
+    "table_id": "3d25eac9-e3d8-4d07-8b9e-3aefa9388eb5",
+    "restaurant_id": "e40bf652-048e-4191-92ed-20c7d8773211",
+    "status":"Pending",
+    "total_price": "2000",
+    "items": "[]"
+}
+
+
+###
+
+GET http://localhost:8000/getTableName/1bd83c29-46a7-4cbf-8e6e-81f78bcf1c65/
+
+###
+### Super Admin Endpoints
+###
+
+### Initialize Super Admin (Run this once after creating the table)
+POST http://localhost:8000/superAdmin/initialize
+Content-Type: application/json
+
+### Super Admin Login
+POST http://localhost:8000/superAdminLogin
+Content-Type: application/json
+
+{
+    "email": "superadmineathub@gmail.com",
+    "password": "superadmin@123"
+}
