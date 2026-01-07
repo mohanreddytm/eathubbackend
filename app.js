@@ -17,7 +17,7 @@ require("dotenv").config();
 const allowedOrigins = [
   'http://localhost:3000',
   'https://ptabletrack.vercel.app',
-  'https://eathubfrontone.vercel.app/'
+  'https://eathubfrontone.vercel.app'
 ];
 
 app.use(cors({
