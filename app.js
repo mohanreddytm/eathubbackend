@@ -17,7 +17,7 @@ require("dotenv").config();
 const allowedOrigins = [
   'http://localhost:3000',
   'https://ptabletrack.vercel.app',
-  'http://10.36.84.89:3000'
+  'https://eathubfrontone.vercel.app/'
 ];
 
 app.use(cors({
@@ -714,372 +714,11 @@ app.put('/updateOrderPaymentStatus/:order_id', async (req, res) => {
     }
 });
 
-// Generate UPI intent URL
-app.post('/generateUPIIntent', async (req, res) => {
-    const { upi_id, restaurant_name, amount, order_id } = req.body;
-
-    if (!upi_id || !restaurant_name || !amount || !order_id) {
-        return res.status(400).json({ error: "Required fields: upi_id, restaurant_name, amount, order_id" });
-    }
-
-    try {
-        // Encode parameters for URL
-        const encodedUPI = encodeURIComponent(upi_id);
-        const encodedRestaurantName = encodeURIComponent(restaurant_name);
-        const encodedOrderId = encodeURIComponent(order_id);
-        
-        // Generate UPI intent URL
-        const upiIntentUrl = `upi://pay?pa=${encodedUPI}&pn=${encodedRestaurantName}&am=${amount.toFixed(2)}&cu=INR&tn=Order_${encodedOrderId}`;
-        
-        res.status(200).json({ upi_intent_url: upiIntentUrl });
-    } catch (error) {
-        console.error("Error generating UPI intent:", error.message);
-        res.status(500).json({ error: "Internal Server Error", details: error.message });
-    }
-});
-
-// Create UPI payment (INITIATED status)
-app.post('/createUPIPayment', async (req, res) => {
-    const {
-        id,
-        restaurant_id,
-        order_id,
-        order_number,
-        table_id,
-        table_name,
-        amount,
-        upi_id
-    } = req.body;
-
-    if (!id || !restaurant_id || !order_id || !amount || !upi_id) {
-        return res.status(400).json({ error: "Required fields: id, restaurant_id, order_id, amount, upi_id" });
-    }
-
-    const client = await pool.connect();
-    try {
-        await client.query('BEGIN');
-
-        const query = `
-            INSERT INTO payments (
-                id, restaurant_id, order_id, order_number, table_id, table_name,
-                amount, payment_method, payment_status, upi_id, transaction_id, notes,
-                created_at, updated_at
-            )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, 'Online', 'INITIATED', $8, $9, $10, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-            RETURNING *;
-        `;
-
-        const transactionId = `UPI_${Date.now()}_${order_id.substring(0, 8)}`;
-        const notes = `UPI payment initiated for order ${order_number || order_id}`;
-
-        const result = await client.query(query, [
-            id,
-            restaurant_id,
-            order_id,
-            order_number || null,
-            table_id || null,
-            table_name || null,
-            amount,
-            upi_id,
-            transactionId,
-            notes
-        ]);
-
-        // Update order payment status
-        await client.query(`
-            UPDATE orders 
-            SET payment_status = 'Pending',
-                payment_method = 'Online',
-                updated_at = CURRENT_TIMESTAMP
-            WHERE id = $1
-        `, [order_id]);
-
-        await client.query('COMMIT');
-        res.status(201).json({ payment: result.rows[0], message: "UPI payment initiated successfully" });
-    } catch (error) {
-        await client.query('ROLLBACK');
-        console.error("Error creating UPI payment:", error.message);
-        res.status(500).json({ error: "Internal Server Error", details: error.message });
-    } finally {
-        client.release();
-    }
-});
-
-// Update payment status to PENDING_CONFIRMATION
-app.put('/confirmPaymentPending/:payment_id', async (req, res) => {
-    const { payment_id } = req.params;
-
-    if (!payment_id) {
-        return res.status(400).json({ error: "Payment ID is required" });
-    }
-
-    const client = await pool.connect();
-    try {
-        await client.query('BEGIN');
-
-        const updateQuery = `
-            UPDATE payments 
-            SET payment_status = 'PENDING_CONFIRMATION',
-                updated_at = CURRENT_TIMESTAMP
-            WHERE id = $1
-            RETURNING *;
-        `;
-
-        const result = await client.query(updateQuery, [payment_id]);
-
-        if (result.rows.length === 0) {
-            await client.query('ROLLBACK');
-            return res.status(404).json({ error: "Payment not found" });
-        }
-
-        await client.query('COMMIT');
-        res.status(200).json({ payment: result.rows[0], message: "Payment marked as pending confirmation" });
-    } catch (error) {
-        await client.query('ROLLBACK');
-        console.error("Error updating payment status:", error.message);
-        res.status(500).json({ error: "Internal Server Error", details: error.message });
-    } finally {
-        client.release();
-    }
-});
-
-// Get pending payments for restaurant
-app.get('/getPendingPayments/:restaurant_id', async (req, res) => {
-    const { restaurant_id } = req.params;
-
-    try {
-        const query = `
-            SELECT * FROM payments 
-            WHERE restaurant_id = $1 
-            AND payment_status = 'PENDING_CONFIRMATION'
-            ORDER BY created_at DESC;
-        `;
-        const result = await pool.query(query, [restaurant_id]);
-        res.status(200).json({ payments: result.rows });
-    } catch (error) {
-        console.error("Error fetching pending payments:", error.message);
-        res.status(500).json({ error: "Internal Server Error", details: error.message });
-    }
-});
-
-// Update payment status (SUCCESS or FAILED) from restaurant dashboard
-app.put('/updatePaymentStatus/:payment_id', async (req, res) => {
-    const { payment_id } = req.params;
-    const { payment_status } = req.body;
-
-    if (!payment_id || !payment_status) {
-        return res.status(400).json({ error: "Payment ID and payment status are required" });
-    }
-
-    if (!['SUCCESS', 'FAILED'].includes(payment_status)) {
-        return res.status(400).json({ error: "Payment status must be SUCCESS or FAILED" });
-    }
-
-    const client = await pool.connect();
-    try {
-        await client.query('BEGIN');
-
-        // Get payment details first
-        const paymentQuery = await client.query('SELECT * FROM payments WHERE id = $1', [payment_id]);
-        
-        if (paymentQuery.rows.length === 0) {
-            await client.query('ROLLBACK');
-            return res.status(404).json({ error: "Payment not found" });
-        }
-
-        const payment = paymentQuery.rows[0];
-
-        // Update payment status
-        const updateQuery = `
-            UPDATE payments 
-            SET payment_status = $1,
-                updated_at = CURRENT_TIMESTAMP
-            WHERE id = $2
-            RETURNING *;
-        `;
-
-        const result = await client.query(updateQuery, [payment_status, payment_id]);
-
-        // If payment is confirmed as SUCCESS, update order status
-        if (payment_status === 'SUCCESS' && payment.order_id) {
-            await client.query(`
-                UPDATE orders 
-                SET payment_status = 'Paid',
-                    payment_method = 'Online',
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE id = $1
-            `, [payment.order_id]);
-        } else if (payment_status === 'FAILED' && payment.order_id) {
-            await client.query(`
-                UPDATE orders 
-                SET payment_status = 'Pending',
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE id = $1
-            `, [payment.order_id]);
-        }
-
-        await client.query('COMMIT');
-        res.status(200).json({ payment: result.rows[0], message: `Payment marked as ${payment_status}` });
-    } catch (error) {
-        await client.query('ROLLBACK');
-        console.error("Error updating payment status:", error.message);
-        res.status(500).json({ error: "Internal Server Error", details: error.message });
-    } finally {
-        client.release();
-    }
-});
-
-// Get payment by ID
-app.get('/getPayment/:payment_id', async (req, res) => {
-    const { payment_id } = req.params;
-
-    try {
-        const query = `SELECT * FROM payments WHERE id = $1`;
-        const result = await pool.query(query, [payment_id]);
-        
-        if (result.rows.length === 0) {
-            return res.status(404).json({ error: "Payment not found" });
-        }
-        
-        res.status(200).json({ payment: result.rows[0] });
-    } catch (error) {
-        console.error("Error fetching payment:", error.message);
-        res.status(500).json({ error: "Internal Server Error", details: error.message });
-    }
-});
-
-// Update order (items, total_price, etc.)
-app.put('/updateOrder/:order_id', async (req, res) => {
-    const { order_id } = req.params;
-    const { items, total_price, discount_amount, tax_amount, note, order_status } = req.body;
-
-    if (!order_id) {
-        return res.status(400).json({ error: "Order ID is required" });
-    }
-
-    try {
-        const updates = [];
-        const values = [];
-        let paramCount = 1;
-
-        if (items !== undefined) {
-            updates.push(`items = $${paramCount}`);
-            values.push(typeof items === 'string' ? items : JSON.stringify(items));
-            paramCount++;
-        }
-        if (total_price !== undefined) {
-            updates.push(`total_price = $${paramCount}`);
-            values.push(total_price);
-            paramCount++;
-        }
-        if (discount_amount !== undefined) {
-            updates.push(`discount_amount = $${paramCount}`);
-            values.push(discount_amount);
-            paramCount++;
-        }
-        if (tax_amount !== undefined) {
-            updates.push(`tax_amount = $${paramCount}`);
-            values.push(tax_amount);
-            paramCount++;
-        }
-        if (note !== undefined) {
-            updates.push(`note = $${paramCount}`);
-            values.push(note);
-            paramCount++;
-        }
-        if (order_status !== undefined) {
-            updates.push(`order_status = $${paramCount}`);
-            values.push(order_status);
-            paramCount++;
-        }
-
-        if (updates.length === 0) {
-            return res.status(400).json({ error: "At least one field to update is required" });
-        }
-
-        updates.push(`updated_at = CURRENT_TIMESTAMP`);
-        values.push(order_id);
-
-        const query = `
-            UPDATE orders 
-            SET ${updates.join(', ')}
-            WHERE id = $${paramCount}
-            RETURNING *;
-        `;
-        
-        const result = await pool.query(query, values);
-        
-        if (result.rows.length === 0) {
-            return res.status(404).json({ error: "Order not found" });
-        }
-        
-        // Parse items if they're JSON string
-        const order = result.rows[0];
-        if (order.items && typeof order.items === 'string') {
-            try {
-                order.items = JSON.parse(order.items);
-            } catch (e) {
-                console.error("Error parsing items:", e);
-            }
-        }
-        
-        res.status(200).json({ order, message: "Order updated successfully" });
-    } catch (error) {
-        console.error("Error updating order:", error.message);
-        res.status(500).json({ error: "Internal Server Error", details: error.message });
-    }
-});
-
-// Delete order
-app.delete('/deleteOrder/:order_id', async (req, res) => {
-    const { order_id } = req.params;
-
-    if (!order_id) {
-        return res.status(400).json({ error: "Order ID is required" });
-    }
-
-    try {
-        const query = `DELETE FROM orders WHERE id = $1 RETURNING *;`;
-        const result = await pool.query(query, [order_id]);
-        
-        if (result.rows.length === 0) {
-            return res.status(404).json({ error: "Order not found" });
-        }
-        
-        res.status(200).json({ message: "Order deleted successfully", order: result.rows[0] });
-    } catch (error) {
-        console.error("Error deleting order:", error.message);
-        res.status(500).json({ error: "Internal Server Error", details: error.message });
-    }
-});
-
 // Get payment settings for restaurant
 app.get('/getPaymentSettings/:restaurant_id', async (req, res) => {
     const { restaurant_id } = req.params;
     try {
-        // Check if payment_settings column exists
-        const columnCheck = await pool.query(`
-            SELECT column_name 
-            FROM information_schema.columns 
-            WHERE table_name = 'restaurant_admin' 
-            AND column_name = 'payment_settings';
-        `);
-        
-        let query;
-        if (columnCheck.rows.length === 0) {
-            // Column doesn't exist, return default settings
-            const defaultSettings = {
-                taxRate: 10,
-                currency: 'INR',
-                paymentMethods: { cash: true, card: true, upi: true, online: false },
-                autoGenerateBill: false,
-                printAutomatically: false,
-                upi_ids: []
-            };
-            return res.status(200).json({ settings: defaultSettings });
-        }
-        
-        query = `
+        const query = `
             SELECT payment_settings FROM restaurant_admin 
             WHERE id = $1;
         `;
@@ -1114,51 +753,23 @@ app.put('/updatePaymentSettings/:restaurant_id', async (req, res) => {
     const { restaurant_id } = req.params;
     const paymentSettings = req.body;
     
-    const client = await pool.connect();
     try {
-        // First, check if payment_settings column exists, if not, add it
-        await client.query('BEGIN');
-        
-        // Check if column exists
-        const columnCheck = await client.query(`
-            SELECT column_name 
-            FROM information_schema.columns 
-            WHERE table_name = 'restaurant_admin' 
-            AND column_name = 'payment_settings';
-        `);
-        
-        if (columnCheck.rows.length === 0) {
-            // Column doesn't exist, add it
-            await client.query(`
-                ALTER TABLE restaurant_admin 
-                ADD COLUMN payment_settings JSONB DEFAULT '{}'::jsonb;
-            `);
-        }
-        
-        // Now update the payment settings
         const query = `
             UPDATE restaurant_admin 
-            SET payment_settings = $1::jsonb
+            SET payment_settings = $1
             WHERE id = $2
             RETURNING *;
         `;
-        
-        const result = await client.query(query, [JSON.stringify(paymentSettings), restaurant_id]);
+        const result = await pool.query(query, [JSON.stringify(paymentSettings), restaurant_id]);
         
         if (result.rows.length === 0) {
-            await client.query('ROLLBACK');
             return res.status(404).json({ error: "Restaurant not found" });
         }
         
-        await client.query('COMMIT');
         res.status(200).json({ message: "Payment settings updated successfully", settings: paymentSettings });
     } catch (error) {
-        await client.query('ROLLBACK').catch(() => {});
         console.error("Error updating payment settings:", error.message);
-        console.error("Full error:", error);
         res.status(500).json({ error: "Internal Server Error", details: error.message });
-    } finally {
-        client.release();
     }
 });
 
@@ -1183,26 +794,6 @@ app.get('/getPayments/:restaurant_id', async (req, res) => {
 app.get('/getDisplaySettings/:restaurant_id', async (req, res) => {
     const { restaurant_id } = req.params;
     try {
-        // Check if display_settings column exists
-        const columnCheck = await pool.query(`
-            SELECT column_name 
-            FROM information_schema.columns 
-            WHERE table_name = 'restaurant_admin' 
-            AND column_name = 'display_settings';
-        `);
-        
-        if (columnCheck.rows.length === 0) {
-            // Column doesn't exist, return default settings
-            const defaultSettings = {
-                theme: 'dark',
-                language: 'en',
-                dateFormat: 'DD/MM/YYYY',
-                timeFormat: '24h',
-                itemsPerPage: 20
-            };
-            return res.status(200).json({ settings: defaultSettings });
-        }
-        
         const query = `
             SELECT display_settings FROM restaurant_admin 
             WHERE id = $1;
@@ -1237,51 +828,23 @@ app.put('/updateDisplaySettings/:restaurant_id', async (req, res) => {
     const { restaurant_id } = req.params;
     const displaySettings = req.body;
     
-    const client = await pool.connect();
     try {
-        // First, check if display_settings column exists, if not, add it
-        await client.query('BEGIN');
-        
-        // Check if column exists
-        const columnCheck = await client.query(`
-            SELECT column_name 
-            FROM information_schema.columns 
-            WHERE table_name = 'restaurant_admin' 
-            AND column_name = 'display_settings';
-        `);
-        
-        if (columnCheck.rows.length === 0) {
-            // Column doesn't exist, add it
-            await client.query(`
-                ALTER TABLE restaurant_admin 
-                ADD COLUMN display_settings JSONB DEFAULT '{}'::jsonb;
-            `);
-        }
-        
-        // Now update the display settings
         const query = `
             UPDATE restaurant_admin 
-            SET display_settings = $1::jsonb
+            SET display_settings = $1
             WHERE id = $2
             RETURNING *;
         `;
-        
-        const result = await client.query(query, [JSON.stringify(displaySettings), restaurant_id]);
+        const result = await pool.query(query, [JSON.stringify(displaySettings), restaurant_id]);
         
         if (result.rows.length === 0) {
-            await client.query('ROLLBACK');
             return res.status(404).json({ error: "Restaurant not found" });
         }
         
-        await client.query('COMMIT');
         res.status(200).json({ message: "Display settings updated successfully", settings: displaySettings });
     } catch (error) {
-        await client.query('ROLLBACK').catch(() => {});
         console.error("Error updating display settings:", error.message);
-        console.error("Full error:", error);
         res.status(500).json({ error: "Internal Server Error", details: error.message });
-    } finally {
-        client.release();
     }
 });
 
