@@ -1,76 +1,15 @@
-/**
- * Script to reset/update the super admin password
- * This ensures the password is correctly hashed
- * 
- * Usage: node reset_super_admin_password.js
- */
-
-const { Pool } = require('pg');
-const bcrypt = require('bcrypt');
+const {Pool}=require('pg');
+const bcrypt=require('bcrypt');
+const {randomUUID}=require('crypto');
 require('dotenv').config();
-
-const databaseUrl = process.env.DATABASE_URL || "postgresql://neondb_owner:npg_80neSdmGjoRi@ep-morning-base-a83jvhq1-pooler.eastus2.azure.neon.tech/neondb?sslmode=require&channel_binding=require";
-
-const pool = new Pool({
-    connectionString: databaseUrl,
-});
-
-async function resetSuperAdminPassword() {
-    try {
-        console.log('🔍 Checking super admin account...');
-        
-        const checkQuery = `SELECT * FROM super_admin WHERE email = $1`;
-        const checkResult = await pool.query(checkQuery, ['superadmineathub@gmail.com']);
-
-        if (checkResult.rows.length === 0) {
-            console.log('❌ Super admin account not found!');
-            console.log('💡 Run: node initialize_super_admin.js first');
-            process.exit(1);
-        }
-
-        console.log('✅ Super admin account found');
-        console.log('🔐 Resetting password...');
-
-        // Hash the password with bcrypt (10 rounds)
-        const hashedPassword = await bcrypt.hash('superadmin@123', 10);
-        
-        // Update the password
-        const updateQuery = `
-            UPDATE super_admin 
-            SET password = $1, updated_at = CURRENT_TIMESTAMP
-            WHERE email = $2
-            RETURNING id, email, name;
-        `;
-        
-        const result = await pool.query(updateQuery, [
-            hashedPassword,
-            'superadmineathub@gmail.com'
-        ]);
-
-        console.log('✅ Password reset successfully!');
-        console.log('\n📋 Updated Credentials:');
-        console.log('   Email: superadmineathub@gmail.com');
-        console.log('   Password: superadmin@123');
-        console.log('\n🎉 You can now login with these credentials!');
-
-        // Verify the password works
-        console.log('\n🔍 Verifying password hash...');
-        const verifyResult = await bcrypt.compare('superadmin@123', hashedPassword);
-        if (verifyResult) {
-            console.log('✅ Password hash verified successfully!');
-        } else {
-            console.log('❌ Password verification failed!');
-        }
-
-    } catch (error) {
-        console.error('❌ Error resetting password:', error.message);
-        console.error('Full error:', error);
-        process.exit(1);
-    } finally {
-        await pool.end();
-    }
+async function main(){
+ const {DATABASE_URL,SUPER_ADMIN_EMAIL,SUPER_ADMIN_PASSWORD}=process.env;
+ if(!DATABASE_URL||!SUPER_ADMIN_EMAIL||!SUPER_ADMIN_PASSWORD||SUPER_ADMIN_PASSWORD.length<12)throw new Error('Set database, email, and a password of at least 12 characters in the environment');
+ const pool=new Pool({connectionString:DATABASE_URL});
+ try{const hash=await bcrypt.hash(SUPER_ADMIN_PASSWORD,12);
+ const r=await pool.query('UPDATE super_admin SET password=$1,updated_at=NOW() WHERE email=$2 RETURNING id',[hash,SUPER_ADMIN_EMAIL]);if(!r.rows.length)throw new Error('Account not found');
+ console.log('Account updated. No credentials are logged.');
+ }finally{await pool.end();}
 }
-
-// Run the reset
-resetSuperAdminPassword();
-
+if(require.main===module)main().catch(()=>{console.error('Account operation failed. Check configuration and database access.');process.exitCode=1;});
+module.exports={main};

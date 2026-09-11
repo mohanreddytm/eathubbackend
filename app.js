@@ -1,3 +1,4 @@
+require('express-async-errors');
 const express = require('express');
 const cors = require('cors');
 const cookieParser = require('cookie-parser');
@@ -9,7 +10,9 @@ const jwt = require('jsonwebtoken');
 
 const bcrypt = require('bcrypt');
 
-app.use(express.json());
+app.use(express.json({limit:'1mb'}));
+const {rateLimit}=require('express-rate-limit');
+app.use(['/superAdminLogin','/restaurantLogin','/restaurant/waiterLogin','/restaurant/kotLogin','/loginCustomer','/addCustomer','/public/guest-session'],rateLimit({windowMs:900000,limit:60,standardHeaders:true,legacyHeaders:false,message:{error:'Too many attempts. Please try again later.'}}));
 app.use(cookieParser());
 
 require("dotenv").config();
@@ -32,7 +35,8 @@ app.use(cors({
 }));
 
 
-const databaseUrl = process.env.DATABASE_URL || "postgresql://neondb_owner:npg_80neSdmGjoRi@ep-morning-base-a83jvhq1-pooler.eastus2.azure.neon.tech/neondb?sslmode=require&channel_binding=require";
+const databaseUrl = process.env.DATABASE_URL;
+if (!databaseUrl) throw new Error("DATABASE_URL is required");
 
 const {Pool} = require('pg');
 const pool = new Pool({
@@ -40,70 +44,11 @@ const pool = new Pool({
 });
 
 
-// Helper: verify Super Admin JWT
-const verifySuperAdmin = (req, res, next) => {
-    try {
-        let token = null;
-        // Prefer Authorization bearer header
-        if (req.headers && req.headers.authorization && req.headers.authorization.startsWith('Bearer ')) {
-            token = req.headers.authorization.split(' ')[1];
-        }
-        // Fallback to cookie
-        if (!token && req.cookies && req.cookies.sa_user) {
-            token = req.cookies.sa_user;
-        }
-        if (!token) {
-            return res.status(401).json({ error: "Unauthorized: token missing" });
-        }
-        const decoded = jwt.verify(token, '10');
-        if (!decoded || decoded.role !== 'super_admin') {
-            return res.status(403).json({ error: "Forbidden: invalid role" });
-        }
-        req.superAdmin = decoded;
-        next();
-    } catch (error) {
-        console.error("Super admin auth error:", error.message);
-        return res.status(401).json({ error: "Unauthorized" });
-    }
-};
-
-// Initialize super admin credentials in database (run once after creating table)
-app.post("/superAdmin/initialize", async (req, res) => {
-    try {
-        // Check if super admin already exists
-        const checkQuery = `SELECT * FROM super_admin WHERE email = $1`;
-        const checkResult = await pool.query(checkQuery, ['superadmineathub@gmail.com']);
-        
-        if (checkResult.rows.length > 0) {
-            return res.status(200).json({ 
-                message: "Super admin already exists",
-                email: checkResult.rows[0].email
-            });
-        }
-
-        // Create super admin with hashed password
-        const hashedPassword = await bcrypt.hash('superadmin@123', 10);
-        const insertQuery = `
-            INSERT INTO super_admin (id, email, password, name)
-            VALUES ($1, $2, $3, $4)
-            RETURNING id, email, name;
-        `;
-        const result = await pool.query(insertQuery, [
-            'super_admin_001',
-            'superadmineathub@gmail.com',
-            hashedPassword,
-            'Super Admin'
-        ]);
-
-        res.status(201).json({ 
-            message: "Super admin initialized successfully",
-            admin: result.rows[0]
-        });
-    } catch (error) {
-        console.error("Error initializing super admin:", error.message);
-        res.status(500).json({ error: "Internal Server Error", details: error.message });
-    }
-});
+const {createSecurity,clean}=require('./lib/security');
+const security=createSecurity(pool,jwt,process.env.JWT_SECRET);
+const {authorize}=security;
+app.use((req,res,next)=>{const json=res.json.bind(res);res.json=value=>json(clean(value));next();});
+app.post('/public/guest-session',security.guestSession);
 
 app.post("/superAdminLogin", async (req, res) => {
     const { email, password } = req.body;
@@ -129,18 +74,18 @@ app.post("/superAdminLogin", async (req, res) => {
         }
 
         // Generate JWT token
-        const token = jwt.sign({ 
+        const token = security.sign({ 
             userId: superAdmin.id, 
             role: 'super_admin',
             email: superAdmin.email
-        }, '10', { expiresIn: '30d' });
+        });
 
         // Set httpOnly cookie
         res.cookie('sa_user', token, {
             httpOnly: true,
             sameSite: 'lax',
-            secure: false, // set true if using https
-            maxAge: 30 * 24 * 60 * 60 * 1000, // 30 days
+            secure: process.env.NODE_ENV === 'production',
+            maxAge: 12 * 60 * 60 * 1000, // 30 days
         });
 
         res.status(200).json({ 
@@ -184,7 +129,7 @@ app.post("/restaurantLogin", async (req, res) => {
             return res.status(401).json({ error: "Invalid email or password" });
         }
 
-        const token = jwt.sign({ userId: user.id }, '10', { expiresIn: '30d' });
+        const token = security.sign({userId:user.id,role:'admin',restaurantId:user.id,name:user.name});
 
         res.status(200).json({ message: "Login successful", userId: user.id, token, user: { name: user.name, email: user.email} });
     } catch (error) {
@@ -229,10 +174,11 @@ app.post("/restaurant/waiterLogin", async (req, res) => {
         }
 
         // Generate JWT token with waiter id and restaurant id
-        const token = jwt.sign({ 
+        await security.activeRestaurant(staff.restaurant_id);
+        const token = security.sign({ 
             userId: staff.id, 
-            restaurantId: staff.restaurant_id 
-        }, '10', { expiresIn: '30d' });
+            restaurantId: staff.restaurant_id, role:'waiter' 
+        });
 
         res.status(200).json({ 
             message: "Login successful", 
@@ -286,10 +232,11 @@ app.post("/restaurant/kotLogin", async (req, res) => {
             return res.status(403).json({ error: "Access denied. Only chefs can login to KOT dashboard." });
         }
 
-        const token = jwt.sign({ 
+        await security.activeRestaurant(staff.restaurant_id);
+        const token = security.sign({ 
             userId: staff.id, 
-            restaurantId: staff.restaurant_id 
-        }, '10', { expiresIn: '30d' });
+            restaurantId: staff.restaurant_id, role:'kot' 
+        });
 
         res.status(200).json({ 
             message: "Login successful", 
@@ -330,10 +277,10 @@ app.post("/restaurant", async (req, res) => {
         `;
 
         const hashedPassword = await bcrypt.hash(password, 10);
-        const values = [name, hashedPassword, email, restaurentname, branchname, branchaddress, phonenumber, id, country, countrycode, is_email_verified, is_phonenumber_verified];
+        const values = [name, hashedPassword, email, restaurentname, branchname, branchaddress, phonenumber, id, country, countrycode, false, false];
         const result = await pool.query(query, values);
 
-        const token = jwt.sign({ userId: result.rows[0].id }, '10', { expiresIn: '30d' });
+        const token = security.sign({userId:result.rows[0].id,role:'admin',restaurantId:result.rows[0].id,name:result.rows[0].name});
 
         res.status(201).json({registration_status: "Success" , user: result.rows[0], token });
 
@@ -385,7 +332,7 @@ app.post('/loginCustomer', async (req, res) => {
         if (!isPasswordValid) {
             return res.status(401).json({ error: "Invalid email or password" });
         }
-        const token = jwt.sign({ userId: user.id }, '10', { expiresIn: '30d' });
+        const token = security.sign({userId:user.id,role:'customer'});
         res.status(200).json({ message: "Login successful", userId: user.id, token, user: { name: user.name, email: user.email} });
     } catch (error) {
         console.error("Error executing query:", error.message);
@@ -394,13 +341,12 @@ app.post('/loginCustomer', async (req, res) => {
     }
 );
 
-app.post('/addNewOrder', async (req, res) => {
+app.post('/addNewOrder',authorize('/addNewOrder',"post"), async (req, res) => {
     const { id, customer_id, table_id, restaurant_id, customer_name, items, total_price, status, waiter_id, order_status, table_name, discount_amount, tax_amount, note } = req.body;
     const client = await pool.connect();
     try{
         // Allow table_id and table_name to be null (for walk-in orders)
         if (!id || !restaurant_id || !items || !total_price || !status || !order_status) {
-            client.release();
             return res.status(400).json({ error: "Required fields: id, restaurant_id, items, total_price, status, order_status" });
         }
         
@@ -443,7 +389,7 @@ app.post('/addNewOrder', async (req, res) => {
     }
 );
 
-app.get('/getOrderRestaurant/:restaurant_id', async (req, res) => {
+app.get('/getOrderRestaurant/:restaurant_id',authorize('/getOrderRestaurant/:restaurant_id',"get"), async (req, res) => {
     const { restaurant_id } = req.params;
     try{
         const query = `
@@ -459,7 +405,7 @@ app.get('/getOrderRestaurant/:restaurant_id', async (req, res) => {
 );
 
 // Orders for KOT / kitchen dashboard - show orders that need to be cooked
-app.get('/getOrdersKitchen/:restaurant_id', async (req, res) => {
+app.get('/getOrdersKitchen/:restaurant_id',authorize('/getOrdersKitchen/:restaurant_id',"get"), async (req, res) => {
     const { restaurant_id } = req.params;
     try{
         const query = `
@@ -477,7 +423,7 @@ app.get('/getOrdersKitchen/:restaurant_id', async (req, res) => {
 });
 
 // Update order_status for an order (used by KOT to move through cooking stages)
-app.put('/updateOrderStatus/:order_id', async (req, res) => {
+app.put('/updateOrderStatus/:order_id',authorize('/updateOrderStatus/:order_id',"put"), async (req, res) => {
     const { order_id } = req.params;
     const { order_status } = req.body;
 
@@ -503,7 +449,7 @@ app.put('/updateOrderStatus/:order_id', async (req, res) => {
     }
 });
 
-app.put('/updateStatus/:order_id/:status/', async (req, res) => {
+app.put('/updateStatus/:order_id/:status/',authorize('/updateStatus/:order_id/:status/',"put"), async (req, res) => {
     const { order_id, status } = req.params;
 
 
@@ -529,7 +475,7 @@ app.put('/updateStatus/:order_id/:status/', async (req, res) => {
     }
 });
 
-app.get('/getOrdersWaiter/:waiter_id', async (req, res) => {
+app.get('/getOrdersWaiter/:waiter_id',authorize('/getOrdersWaiter/:waiter_id',"get"), async (req, res) => {
     const { waiter_id } = req.params;
     try{
         const query = `
@@ -544,7 +490,7 @@ app.get('/getOrdersWaiter/:waiter_id', async (req, res) => {
     }
 );
 
-app.get('/waiterDetailsRestaurant/:waiter_id', async (req, res) => {
+app.get('/waiterDetailsRestaurant/:waiter_id',authorize('/waiterDetailsRestaurant/:waiter_id',"get"), async (req, res) => {
     const { waiter_id } = req.params;
     try{
         const query = `
@@ -560,7 +506,7 @@ app.get('/waiterDetailsRestaurant/:waiter_id', async (req, res) => {
 );
 
 
-app.get('/getOrderCustomer/:customer_id', async (req, res) => {
+app.get('/getOrderCustomer/:customer_id',authorize('/getOrderCustomer/:customer_id',"get"), async (req, res) => {
     const { customer_id } = req.params;
     try{
         const query = `
@@ -576,7 +522,7 @@ app.get('/getOrderCustomer/:customer_id', async (req, res) => {
 );
 
 // Get orders by table_id (for customer dashboard order status)
-app.get('/getOrdersByTable/:table_id', async (req, res) => {
+app.get('/getOrdersByTable/:table_id',authorize('/getOrdersByTable/:table_id',"get"), async (req, res) => {
     const { table_id } = req.params;
     try{
         const query = `
@@ -593,7 +539,7 @@ app.get('/getOrdersByTable/:table_id', async (req, res) => {
 });
 
 // Get order details by order id
-app.get('/getOrderDetails/:order_id', async (req, res) => {
+app.get('/getOrderDetails/:order_id',authorize('/getOrderDetails/:order_id',"get"), async (req, res) => {
     const { order_id } = req.params;
     try{
         if (!order_id) {
@@ -625,7 +571,7 @@ app.get('/getOrderDetails/:order_id', async (req, res) => {
 });
 
 // Create payment
-app.post('/createPayment', async (req, res) => {
+app.post('/createPayment',authorize('/createPayment',"post"), async (req, res) => {
     const {
         id,
         restaurant_id,
@@ -684,7 +630,7 @@ app.post('/createPayment', async (req, res) => {
 });
 
 // Update order payment status
-app.put('/updateOrderPaymentStatus/:order_id', async (req, res) => {
+app.put('/updateOrderPaymentStatus/:order_id',authorize('/updateOrderPaymentStatus/:order_id',"put"), async (req, res) => {
     const { order_id } = req.params;
     const { payment_status, payment_method } = req.body;
 
@@ -715,7 +661,7 @@ app.put('/updateOrderPaymentStatus/:order_id', async (req, res) => {
 });
 
 // Get payment settings for restaurant
-app.get('/getPaymentSettings/:restaurant_id', async (req, res) => {
+app.get('/getPaymentSettings/:restaurant_id',authorize('/getPaymentSettings/:restaurant_id',"get"), async (req, res) => {
     const { restaurant_id } = req.params;
     try {
         const query = `
@@ -749,7 +695,7 @@ app.get('/getPaymentSettings/:restaurant_id', async (req, res) => {
 });
 
 // Update payment settings for restaurant
-app.put('/updatePaymentSettings/:restaurant_id', async (req, res) => {
+app.put('/updatePaymentSettings/:restaurant_id',authorize('/updatePaymentSettings/:restaurant_id',"put"), async (req, res) => {
     const { restaurant_id } = req.params;
     const paymentSettings = req.body;
     
@@ -774,7 +720,7 @@ app.put('/updatePaymentSettings/:restaurant_id', async (req, res) => {
 });
 
 // Get all payments for restaurant
-app.get('/getPayments/:restaurant_id', async (req, res) => {
+app.get('/getPayments/:restaurant_id',authorize('/getPayments/:restaurant_id',"get"), async (req, res) => {
     const { restaurant_id } = req.params;
     try {
         const query = `
@@ -791,7 +737,7 @@ app.get('/getPayments/:restaurant_id', async (req, res) => {
 });
 
 // Get display settings for restaurant
-app.get('/getDisplaySettings/:restaurant_id', async (req, res) => {
+app.get('/getDisplaySettings/:restaurant_id',authorize('/getDisplaySettings/:restaurant_id',"get"), async (req, res) => {
     const { restaurant_id } = req.params;
     try {
         const query = `
@@ -824,7 +770,7 @@ app.get('/getDisplaySettings/:restaurant_id', async (req, res) => {
 });
 
 // Update display settings for restaurant
-app.put('/updateDisplaySettings/:restaurant_id', async (req, res) => {
+app.put('/updateDisplaySettings/:restaurant_id',authorize('/updateDisplaySettings/:restaurant_id',"put"), async (req, res) => {
     const { restaurant_id } = req.params;
     const displaySettings = req.body;
     
@@ -850,7 +796,7 @@ app.put('/updateDisplaySettings/:restaurant_id', async (req, res) => {
 
 
 
-app.post("/restaurant_details/addAreas", async (req, res) => {
+app.post("/restaurant_details/addAreas",authorize("/restaurant_details/addAreas","post"), async (req, res) => {
   const areas = req.body;
 
   if (!Array.isArray(areas) || areas.length === 0) {
@@ -891,7 +837,7 @@ app.post("/restaurant_details/addAreas", async (req, res) => {
   }
 });
 
-app.get('/restaurant_details/getStaff/:restaurant_id', async (req, res) => {
+app.get('/restaurant_details/getStaff/:restaurant_id',authorize('/restaurant_details/getStaff/:restaurant_id',"get"), async (req, res) => {
     const { restaurant_id } = req.params;
 
     if (!restaurant_id) {
@@ -911,7 +857,7 @@ app.get('/restaurant_details/getStaff/:restaurant_id', async (req, res) => {
     }
 });
 
-app.delete('/restaurant_details/deleteStaff/:staff_id/:restaurant_id', async (req, res) => {
+app.delete('/restaurant_details/deleteStaff/:staff_id/:restaurant_id',authorize('/restaurant_details/deleteStaff/:staff_id/:restaurant_id',"delete"), async (req, res) => {
     const { staff_id, restaurant_id } = req.params;
 
     if (!staff_id || !restaurant_id) {
@@ -931,27 +877,7 @@ app.delete('/restaurant_details/deleteStaff/:staff_id/:restaurant_id', async (re
     }
 });
 
-app.post('/restaurant_details/addRole', async (req, res) => {
-    const { role_id, role_name, restaurant_id } = req.body;
-
-    if (!role_id || !role_name || !restaurant_id) {
-        return res.status(400).json({ error: "All fields are required" });
-    }
-
-    try {
-        const query = `
-            INSERT INTO restaurant_roles (id, role_name, restaurant_id)
-            VALUES ($1, $2, $3);
-        `;
-        await pool.query(query, [role_id, role_name, restaurant_id]);
-        res.status(201).json({ message: "Role added successfully" });
-    } catch (error) {
-        console.error("Error adding role:", error.message);
-        res.status(500).json({ error: "Internal Server Error" });
-    }
-});
-
-app.put('/restaurant_details/updateStaff', async (req, res) => {
+app.put('/restaurant_details/updateStaff',authorize('/restaurant_details/updateStaff',"put"), async (req, res) => {
     const { staff_id, staff_name, restaurant_id, staff_email,
         staff_phone, staff_salary, staff_shift_timing, staff_status, staff_address, staff_role, staff_image, staff_experience, staff_ratings, waiter_total_orders_served, waiter_assigned_tables, password} = req.body;
 
@@ -1003,7 +929,7 @@ app.put('/restaurant_details/updateStaff', async (req, res) => {
     }
 });
 
-app.post('/restaurant_details/addStaff', async(req, res) => {
+app.post('/restaurant_details/addStaff',authorize('/restaurant_details/addStaff',"post"), async(req, res) => {
     const { staff_id, staff_name, restaurant_id, staff_email, staff_phone, staff_salary, staff_shift_timing, staff_status, staff_address, staff_role, staff_image, password } = req.body;
 
     // Required fields only
@@ -1034,7 +960,7 @@ app.post('/restaurant_details/addStaff', async(req, res) => {
     }
 });
 
-app.put('/restaurant_details/updateArea', async (req, res) => {
+app.put('/restaurant_details/updateArea',authorize('/restaurant_details/updateArea',"put"), async (req, res) => {
     const { area_id, area_name, restaurant_id } = req.body;
 
     if (!area_id || !area_name || !restaurant_id) {
@@ -1056,7 +982,7 @@ app.put('/restaurant_details/updateArea', async (req, res) => {
 });
 
 
-app.delete('/deleteArea/:area_id/:restaurant_id', async (req, res) => {
+app.delete('/deleteArea/:area_id/:restaurant_id',authorize('/deleteArea/:area_id/:restaurant_id',"delete"), async (req, res) => {
     const { area_id, restaurant_id } = req.params;
 
     try {
@@ -1090,7 +1016,7 @@ app.delete('/deleteArea/:area_id/:restaurant_id', async (req, res) => {
     }
 });
 
-app.put('/restaurant_details/updateTable/', async (req, res) => {
+app.put('/restaurant_details/updateTable/',authorize('/restaurant_details/updateTable/',"put"), async (req, res) => {
     const { table_id, table_name, table_capacity, table_status, restaurant_id, area_id } = req.body;
 
     if (!table_id || !table_name || !table_capacity || !table_status || !restaurant_id || !area_id) {
@@ -1112,7 +1038,7 @@ app.put('/restaurant_details/updateTable/', async (req, res) => {
 });
 
 
-app.delete('/deleteTable/:table_id/:restaurant_id', async (req, res) => {
+app.delete('/deleteTable/:table_id/:restaurant_id',authorize('/deleteTable/:table_id/:restaurant_id',"delete"), async (req, res) => {
     const { table_id, restaurant_id } = req.params;
     
     try {
@@ -1147,7 +1073,7 @@ app.delete('/deleteTable/:table_id/:restaurant_id', async (req, res) => {
 });
 
 
-app.post('/restaurant_details/addTable', async (req, res) => {
+app.post('/restaurant_details/addTable',authorize('/restaurant_details/addTable',"post"), async (req, res) => {
     const tables = req.body;
     if (!Array.isArray(tables) || tables.length === 0) {
         return res.status(400).json({ error: "Tables list is required" });
@@ -1187,7 +1113,7 @@ app.post('/restaurant_details/addTable', async (req, res) => {
 
 });
 
-app.delete('/deleteMenuCategoryCompletly/:category_id', async (req , res) => {
+app.delete('/deleteMenuCategoryCompletly/:category_id',authorize('/deleteMenuCategoryCompletly/:category_id',"delete"), async (req , res) => {
     const {category_id} = req.params;
     if(!category_id){
         res.status(400).json({error: "Category id is not present"})
@@ -1205,7 +1131,7 @@ app.delete('/deleteMenuCategoryCompletly/:category_id', async (req , res) => {
     }
 })
 
-app.put('/restaurant_details/updateMenuCategoryName', async(req,res) => {
+app.put('/restaurant_details/updateMenuCategoryName',authorize('/restaurant_details/updateMenuCategoryName',"put"), async(req,res) => {
     const details = req.body;
     const {menu_category_name, id} = details;
     if(!menu_category_name || !id){
@@ -1226,7 +1152,7 @@ app.put('/restaurant_details/updateMenuCategoryName', async(req,res) => {
     }
 })
 
-app.post('/restaurant_details/addMenuCategory', async (req, res) => {
+app.post('/restaurant_details/addMenuCategory',authorize('/restaurant_details/addMenuCategory',"post"), async (req, res) => {
     const categories = req.body;
 
     if (!Array.isArray(categories) || categories.length === 0) {
@@ -1272,7 +1198,7 @@ app.post('/restaurant_details/addMenuCategory', async (req, res) => {
 });
 
 
-app.get('/getMenuItems/:restaurant_id', async (req, res) => {
+app.get('/getMenuItems/:restaurant_id',authorize('/getMenuItems/:restaurant_id',"get"), async (req, res) => {
     const restaurant_id = req.params.restaurant_id;
     const query = 'SELECT * FROM restaurant_menu_items WHERE restaurant_id = $1';
     const result = await pool.query(query, [restaurant_id]);
@@ -1282,7 +1208,7 @@ app.get('/getMenuItems/:restaurant_id', async (req, res) => {
 
 
 
-app.delete('/deleteMenuItem/:item_id/:restaurant_id', async (req , res) => {
+app.delete('/deleteMenuItem/:item_id/:restaurant_id',authorize('/deleteMenuItem/:item_id/:restaurant_id',"delete"), async (req , res) => {
     const {item_id, restaurant_id} = req.params;
     if(!item_id || !restaurant_id){
         return res.status(400).json({error: "All feilds are required"});
@@ -1296,7 +1222,7 @@ app.delete('/deleteMenuItem/:item_id/:restaurant_id', async (req , res) => {
     }
 })
 
-app.put('/restaurant_details/updateMenuItem', async (req, res) => {
+app.put('/restaurant_details/updateMenuItem',authorize('/restaurant_details/updateMenuItem',"put"), async (req, res) => {
     const { item_id, item_name, item_dec, category_name, item_price, item_menu_category_id, item_category, item_url, item_availabiliy, item_preparation_time, restaurant_id } = req.body;
     if (!item_id || !item_name || !item_dec || !category_name || !item_price || !item_menu_category_id || !item_category || !item_availabiliy || !item_preparation_time || !restaurant_id) {
         return res.status(400).json({ error: "All fields are required" });
@@ -1338,7 +1264,7 @@ app.put('/restaurant_details/updateMenuItem', async (req, res) => {
     }
 });
 
-app.get('/restaurant_details/getMenuCategory/:restaurant_id', async (req, res) => {
+app.get('/restaurant_details/getMenuCategory/:restaurant_id',authorize('/restaurant_details/getMenuCategory/:restaurant_id',"get"), async (req, res) => {
     const restaurant_id = req.params.restaurant_id;
 
     const query = "SELECT c.id, c.menu_category_name, COUNT(i.menu_category_id) AS item_count FROM restaurant_menu_category c LEFT JOIN restaurant_menu_items i ON c.id = i.menu_category_id WHERE c.restaurant_id=$1 GROUP BY c.menu_category_name, c.id;";
@@ -1346,7 +1272,7 @@ app.get('/restaurant_details/getMenuCategory/:restaurant_id', async (req, res) =
     res.status(200).json(result.rows);
 });
 
-app.post('/restaurant_details/addMenuItems', async (req, res) => {
+app.post('/restaurant_details/addMenuItems',authorize('/restaurant_details/addMenuItems',"post"), async (req, res) => {
     const items = req.body;
 
     if (!Array.isArray(items) || items.length === 0) {
@@ -1428,7 +1354,7 @@ app.post('/restaurant_details/addMenuItems', async (req, res) => {
 
 // Create a new waiter request (called from customer dashboard "Call Waiter")
 // Auto-assigns to top available waiter
-app.post('/createWaiterRequest', async (req, res) => {
+app.post('/createWaiterRequest',authorize('/createWaiterRequest',"post"), async (req, res) => {
     const {
         id,
         restaurant_id,
@@ -1491,7 +1417,7 @@ app.post('/createWaiterRequest', async (req, res) => {
                    AND wr.status IN ('pending', 'assigned')
                 WHERE rs.restaurant_id = $1
                   AND LOWER(COALESCE(rs.role, '')) LIKE '%waiter%'
-                  AND (rs.status IS NULL OR LOWER(rs.status) NOT LIKE '%busy%')
+                  AND LOWER(COALESCE(rs.status,'active')) IN ('active','available','serving')
                 GROUP BY rs.id
             ),
             min_count AS (
@@ -1559,7 +1485,7 @@ app.post('/createWaiterRequest', async (req, res) => {
 });
 
 // Get all pending waiter requests for a restaurant (used in restaurant dashboard WaiterRequest page)
-app.get('/getPendingWaiterRequests/:restaurant_id', async (req, res) => {
+app.get('/getPendingWaiterRequests/:restaurant_id',authorize('/getPendingWaiterRequests/:restaurant_id',"get"), async (req, res) => {
     const { restaurant_id } = req.params;
 
     if (!restaurant_id) {
@@ -1588,7 +1514,7 @@ app.get('/getPendingWaiterRequests/:restaurant_id', async (req, res) => {
 });
 
 // Get waiters with their current status and number of assigned pending requests
-app.get('/getWaitersWithStatus/:restaurant_id', async (req, res) => {
+app.get('/getWaitersWithStatus/:restaurant_id',authorize('/getWaitersWithStatus/:restaurant_id',"get"), async (req, res) => {
     const { restaurant_id } = req.params;
 
     if (!restaurant_id) {
@@ -1619,7 +1545,7 @@ app.get('/getWaitersWithStatus/:restaurant_id', async (req, res) => {
 });
 
 // Assign a waiter to a specific waiter request
-app.put('/assignWaiterToRequest/:request_id', async (req, res) => {
+app.put('/assignWaiterToRequest/:request_id',authorize('/assignWaiterToRequest/:request_id',"put"), async (req, res) => {
     const { request_id } = req.params;
     const { waiter_id } = req.body;
 
@@ -1655,7 +1581,7 @@ app.put('/assignWaiterToRequest/:request_id', async (req, res) => {
 // ===========================
 
 // Create a new admin call to a waiter
-app.post('/createAdminCall', async (req, res) => {
+app.post('/createAdminCall',authorize('/createAdminCall',"post"), async (req, res) => {
     const {
         id,
         restaurant_id,
@@ -1704,7 +1630,7 @@ app.post('/createAdminCall', async (req, res) => {
 });
 
 // Get pending admin calls for a specific waiter (used in waiter dashboard)
-app.get('/getPendingAdminCallsWaiter/:waiter_id', async (req, res) => {
+app.get('/getPendingAdminCallsWaiter/:waiter_id',authorize('/getPendingAdminCallsWaiter/:waiter_id',"get"), async (req, res) => {
     const { waiter_id } = req.params;
 
     if (!waiter_id) {
@@ -1729,7 +1655,7 @@ app.get('/getPendingAdminCallsWaiter/:waiter_id', async (req, res) => {
 });
 
 // Get recent admin calls for a restaurant (used in restaurant dashboard if needed)
-app.get('/getAdminCallsRestaurant/:restaurant_id', async (req, res) => {
+app.get('/getAdminCallsRestaurant/:restaurant_id',authorize('/getAdminCallsRestaurant/:restaurant_id',"get"), async (req, res) => {
     const { restaurant_id } = req.params;
 
     if (!restaurant_id) {
@@ -1754,7 +1680,7 @@ app.get('/getAdminCallsRestaurant/:restaurant_id', async (req, res) => {
 });
 
 // Update admin call status (e.g., answered, missed, cancelled)
-app.put('/updateAdminCallStatus/:id', async (req, res) => {
+app.put('/updateAdminCallStatus/:id',authorize('/updateAdminCallStatus/:id',"put"), async (req, res) => {
     const { id } = req.params;
     const { status } = req.body;
 
@@ -1791,7 +1717,7 @@ app.put('/updateAdminCallStatus/:id', async (req, res) => {
 
 // Update waiter status (e.g., available, serving, busy)
 // If setting to busy, reassign pending requests to next waiter
-app.put('/updateWaiterStatus/:waiter_id', async (req, res) => {
+app.put('/updateWaiterStatus/:waiter_id',authorize('/updateWaiterStatus/:waiter_id',"put"), async (req, res) => {
     const { waiter_id } = req.params;
     const { status } = req.body;
 
@@ -1838,7 +1764,7 @@ app.put('/updateWaiterStatus/:waiter_id', async (req, res) => {
                     WHERE rs.restaurant_id = $1
                       AND rs.id != $2
                       AND LOWER(COALESCE(rs.role, '')) LIKE '%waiter%'
-                      AND (rs.status IS NULL OR LOWER(rs.status) NOT LIKE '%busy%')
+                      AND LOWER(COALESCE(rs.status,'active')) IN ('active','available','serving')
                     GROUP BY rs.id
                     ORDER BY 
                         CASE 
@@ -1900,7 +1826,7 @@ app.put('/updateWaiterStatus/:waiter_id', async (req, res) => {
 });
 
 // Mark waiter request as completed and move waiter to end of list
-app.put('/completeWaiterRequest/:request_id', async (req, res) => {
+app.put('/completeWaiterRequest/:request_id',authorize('/completeWaiterRequest/:request_id',"put"), async (req, res) => {
     const { request_id } = req.params;
 
     try {
@@ -1965,7 +1891,7 @@ app.put('/completeWaiterRequest/:request_id', async (req, res) => {
 // ===========================
 
 // Get chat messages for a restaurant
-app.get('/restaurant_messages/:restaurant_id', async (req, res) => {
+app.get('/restaurant_messages/:restaurant_id',authorize('/restaurant_messages/:restaurant_id',"get"), async (req, res) => {
     const { restaurant_id } = req.params;
 
     if (!restaurant_id) {
@@ -1989,7 +1915,7 @@ app.get('/restaurant_messages/:restaurant_id', async (req, res) => {
 });
 
 // Post a new chat message (admin or waiter)
-app.post('/restaurant_messages', async (req, res) => {
+app.post('/restaurant_messages',authorize('/restaurant_messages',"post"), async (req, res) => {
     const {
         id,
         restaurant_id,
@@ -2034,7 +1960,7 @@ app.post('/restaurant_messages', async (req, res) => {
 });
 
 // Super Admin logout endpoint
-app.post('/superAdmin/logout', verifySuperAdmin, async (req, res) => {
+app.post('/superAdmin/logout',authorize('/superAdmin/logout',"post"), async (req, res) => {
     try {
         // Clear the HttpOnly cookie
         res.clearCookie('sa_user', {
@@ -2050,7 +1976,7 @@ app.post('/superAdmin/logout', verifySuperAdmin, async (req, res) => {
 });
 
 // Super Admin endpoints
-app.get('/superAdmin/getAllRestaurants', verifySuperAdmin, async (req, res) => {
+app.get('/superAdmin/getAllRestaurants',authorize('/superAdmin/getAllRestaurants',"get"), async (req, res) => {
     try {
         // Try to get columns, use COALESCE to default to true/false if columns don't exist
         const query = `
@@ -2090,7 +2016,7 @@ app.get('/superAdmin/getAllRestaurants', verifySuperAdmin, async (req, res) => {
     }
 });
 
-app.put('/superAdmin/updateRestaurantStatus/:restaurant_id', verifySuperAdmin, async (req, res) => {
+app.put('/superAdmin/updateRestaurantStatus/:restaurant_id',authorize('/superAdmin/updateRestaurantStatus/:restaurant_id',"put"), async (req, res) => {
     const { restaurant_id } = req.params;
     const { is_active, is_suspended } = req.body;
     try {
@@ -2136,7 +2062,7 @@ app.put('/superAdmin/updateRestaurantStatus/:restaurant_id', verifySuperAdmin, a
     }
 });
 
-app.delete('/superAdmin/deleteRestaurant/:restaurant_id', verifySuperAdmin, async (req, res) => {
+app.delete('/superAdmin/deleteRestaurant/:restaurant_id',authorize('/superAdmin/deleteRestaurant/:restaurant_id',"delete"), async (req, res) => {
     const { restaurant_id } = req.params;
     try {
         const query = `DELETE FROM restaurant_admin WHERE id = $1 RETURNING *;`;
@@ -2151,7 +2077,7 @@ app.delete('/superAdmin/deleteRestaurant/:restaurant_id', verifySuperAdmin, asyn
     }
 });
 
-app.get('/superAdmin/getRestaurantStats/:restaurant_id', verifySuperAdmin, async (req, res) => {
+app.get('/superAdmin/getRestaurantStats/:restaurant_id',authorize('/superAdmin/getRestaurantStats/:restaurant_id',"get"), async (req, res) => {
     const { restaurant_id } = req.params;
     try {
         // Get order count
@@ -2170,9 +2096,7 @@ app.get('/superAdmin/getRestaurantStats/:restaurant_id', verifySuperAdmin, async
         const tablesResult = await pool.query(
             `SELECT COUNT(*) as total_tables 
              FROM restaurant_tables 
-             WHERE restaurant_id IN (
-                 SELECT id FROM restaurant_area WHERE restaurant_id = $1
-             )`,
+             WHERE restaurant_id = $1`,
             [restaurant_id]
         );
 
@@ -2187,7 +2111,7 @@ app.get('/superAdmin/getRestaurantStats/:restaurant_id', verifySuperAdmin, async
     }
 });
 
-app.get('/getTableName/:table_id', async (req, res) => {
+app.get('/getTableName/:table_id',authorize('/getTableName/:table_id',"get"), async (req, res) => {
     const table_id = req.params.table_id;
     try{
         const result = await pool.query("SELECT * from restaurant_tables where id = $1", [table_id]);
@@ -2197,14 +2121,14 @@ app.get('/getTableName/:table_id', async (req, res) => {
     }
 })
 
-app.get('/getTables/:area_id', async (req, res) => {
+app.get('/getTables/:area_id',authorize('/getTables/:area_id',"get"), async (req, res) => {
     const area_id = req.params.area_id;
     const query = 'SELECT * FROM restaurant_tables WHERE area_id = $1';
     const result = await pool.query(query, [area_id]);
     res.status(200).json(result.rows);
 });
 
-app.get('/getAreas/:restaurant_id', async (req, res) => {
+app.get('/getAreas/:restaurant_id',authorize('/getAreas/:restaurant_id',"get"), async (req, res) => {
     const restaurant_id = req.params.restaurant_id;
     const query = 'SELECT * FROM restaurant_area WHERE restaurant_id = $1';
     const result = await pool.query(query, [restaurant_id]);
@@ -2213,10 +2137,10 @@ app.get('/getAreas/:restaurant_id', async (req, res) => {
 
 
 
-app.get("/restaurant/:id", async (req, res) => {
+app.get("/restaurant/:id",authorize("/restaurant/:id","get"), async (req, res) => {
     try {
         const id = req.params.id;
-        const query = 'SELECT * FROM restaurant_admin WHERE id = $1';
+        const query = req.user.role === 'guest' ? 'SELECT id,restaurentname,branchname,branchaddress,country FROM restaurant_admin WHERE id=$1' : 'SELECT * FROM restaurant_admin WHERE id=$1';
         const result = await pool.query(query, [id]);
         res.json(result.rows); // send the data as JSON
     } catch (error) {
@@ -2226,7 +2150,7 @@ app.get("/restaurant/:id", async (req, res) => {
 });
 
 
-app.get("/restaurant", async (req, res) => {
+app.get("/restaurant",authorize("/restaurant","get"), async (req, res) => {
     const url = "select * from restaurant_admin;";
     try {
         const result = await pool.query(url);
@@ -2244,7 +2168,7 @@ app.get("/ping", (req, res) => {
 // Reservation API Endpoints
 
 // Get all reservations for a restaurant
-app.get('/getReservations/:restaurant_id', async (req, res) => {
+app.get('/getReservations/:restaurant_id',authorize('/getReservations/:restaurant_id',"get"), async (req, res) => {
     const { restaurant_id } = req.params;
     try {
         const query = `
@@ -2261,7 +2185,7 @@ app.get('/getReservations/:restaurant_id', async (req, res) => {
 });
 
 // Add a new reservation
-app.post('/addReservation', async (req, res) => {
+app.post('/addReservation',authorize('/addReservation',"post"), async (req, res) => {
     const { 
         id, 
         restaurant_id, 
@@ -2279,7 +2203,6 @@ app.post('/addReservation', async (req, res) => {
     const client = await pool.connect();
     try {
         if (!id || !restaurant_id || !customer_name || !email || !phone || !date || !time || !guests || !table_id) {
-            client.release();
             return res.status(400).json({ error: "Required fields: id, restaurant_id, customer_name, email, phone, date, time, guests, table_id" });
         }
 
@@ -2318,7 +2241,7 @@ app.post('/addReservation', async (req, res) => {
 });
 
 // Update a reservation
-app.put('/updateReservation/:id', async (req, res) => {
+app.put('/updateReservation/:id',authorize('/updateReservation/:id',"put"), async (req, res) => {
     const { id } = req.params;
     const { 
         customer_name, 
@@ -2359,7 +2282,6 @@ app.put('/updateReservation/:id', async (req, res) => {
 
         if (result.rows.length === 0) {
             await client.query('ROLLBACK');
-            client.release();
             return res.status(404).json({ error: "Reservation not found" });
         }
 
@@ -2375,7 +2297,7 @@ app.put('/updateReservation/:id', async (req, res) => {
 });
 
 // Delete a reservation
-app.delete('/deleteReservation/:id', async (req, res) => {
+app.delete('/deleteReservation/:id',authorize('/deleteReservation/:id',"delete"), async (req, res) => {
     const { id } = req.params;
     const client = await pool.connect();
     try {
@@ -2386,7 +2308,6 @@ app.delete('/deleteReservation/:id', async (req, res) => {
 
         if (result.rows.length === 0) {
             await client.query('ROLLBACK');
-            client.release();
             return res.status(404).json({ error: "Reservation not found" });
         }
 
@@ -2401,6 +2322,8 @@ app.delete('/deleteReservation/:id', async (req, res) => {
     }
 });
 
-app.listen(port, () => {
+app.use((error,req,res,next)=>{if(res.headersSent)return next(error);const status=error.status||(error.code==='23503'?409:500);res.status(status).json({error:status<500?error.message:'Request could not be completed'});});
+module.exports={app,pool};
+if(require.main===module) app.listen(port, () => {
     console.log(`Server is running on http://localhost:${port}`);
 });
