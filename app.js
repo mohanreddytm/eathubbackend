@@ -38,7 +38,9 @@ app.use(cors({
 const databaseUrl = process.env.DATABASE_URL;
 if (!databaseUrl) throw new Error("DATABASE_URL is required");
 
-const {Pool} = require('pg');
+const {Pool, types} = require('pg');
+// PostgreSQL DATE represents a calendar date, not an instant.
+types.setTypeParser(1082, value => value);
 const pool = new Pool({
       connectionString: databaseUrl ,
 });
@@ -74,7 +76,7 @@ app.post("/superAdminLogin", async (req, res) => {
         }
 
         // Generate JWT token
-        const token = security.sign({ 
+        const token = security.sign({
             userId: superAdmin.id, 
             role: 'super_admin',
             email: superAdmin.email
@@ -175,9 +177,9 @@ app.post("/restaurant/waiterLogin", async (req, res) => {
 
         // Generate JWT token with waiter id and restaurant id
         await security.activeRestaurant(staff.restaurant_id);
-        const token = security.sign({ 
+        const token = security.sign({
             userId: staff.id, 
-            restaurantId: staff.restaurant_id, role:'waiter' 
+            restaurantId: staff.restaurant_id, role:'waiter'
         });
 
         res.status(200).json({ 
@@ -233,9 +235,9 @@ app.post("/restaurant/kotLogin", async (req, res) => {
         }
 
         await security.activeRestaurant(staff.restaurant_id);
-        const token = security.sign({ 
+        const token = security.sign({
             userId: staff.id, 
-            restaurantId: staff.restaurant_id, role:'kot' 
+            restaurantId: staff.restaurant_id, role:'kot'
         });
 
         res.status(200).json({ 
@@ -341,54 +343,6 @@ app.post('/loginCustomer', async (req, res) => {
     }
 );
 
-app.post('/addNewOrder',authorize('/addNewOrder',"post"), async (req, res) => {
-    const { id, customer_id, table_id, restaurant_id, customer_name, items, total_price, status, waiter_id, order_status, table_name, discount_amount, tax_amount, note } = req.body;
-    const client = await pool.connect();
-    try{
-        // Allow table_id and table_name to be null (for walk-in orders)
-        if (!id || !restaurant_id || !items || !total_price || !status || !order_status) {
-            return res.status(400).json({ error: "Required fields: id, restaurant_id, items, total_price, status, order_status" });
-        }
-        
-        await client.query('BEGIN');
-        
-        // Use advisory lock to prevent race conditions when calculating order number
-        const lockResult = await client.query(`SELECT hashtext($1)::bigint as lock_key`, [restaurant_id]);
-        await client.query('SELECT pg_advisory_xact_lock($1)', [lockResult.rows[0].lock_key]);
-        
-        // Efficient single query: Calculate order number and insert atomically using CTE
-        const query = `
-            WITH today_max_order AS (
-                SELECT COALESCE(MAX(order_number), 0) + 1 AS next_order_number
-                FROM orders
-                WHERE restaurant_id = $4
-                AND created_at >= CURRENT_DATE
-                AND created_at < CURRENT_DATE + INTERVAL '1 day'
-            )
-            INSERT INTO orders (id, customer_id, table_id, restaurant_id, customer_name, items, total_price, status, waiter_id, order_status, table_name, order_number, discount_amount, tax_amount, note)
-            SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, next_order_number, $12, $13, $14
-            FROM today_max_order
-            RETURNING order_number;
-        `;
-        const result = await client.query(query, [
-            id, customer_id, table_id, restaurant_id, customer_name, items, total_price, 
-            status, waiter_id, order_status, table_name, 
-            discount_amount || null, tax_amount || null, note || null
-        ]);
-        
-        await client.query('COMMIT');
-        
-        res.status(201).json({ message: "Order added successfully", order_number: result.rows[0].order_number });
-    } catch (error) {
-        await client.query('ROLLBACK').catch(() => {});
-        console.error("Error executing query:", error.message);
-        res.status(500).json({ error: "Internal Server Error", details: error.message });
-    } finally {
-        client.release();
-    }
-    }
-);
-
 app.get('/getOrderRestaurant/:restaurant_id',authorize('/getOrderRestaurant/:restaurant_id',"get"), async (req, res) => {
     const { restaurant_id } = req.params;
     try{
@@ -415,7 +369,7 @@ app.get('/getOrdersKitchen/:restaurant_id',authorize('/getOrdersKitchen/:restaur
             ORDER BY created_at ASC;
         `;
         const result = await pool.query(query, [restaurant_id]);
-        res.status(200).json({ order: result.rows });
+        res.status(200).json({ order: result.rows.map(o=>({...o,items:o.kot_items||o.items})) });
     } catch (error) {
         console.error("Error executing query:", error.message);
         res.status(500).json({ error: "Internal Server Error" });
@@ -423,58 +377,6 @@ app.get('/getOrdersKitchen/:restaurant_id',authorize('/getOrdersKitchen/:restaur
 });
 
 // Update order_status for an order (used by KOT to move through cooking stages)
-app.put('/updateOrderStatus/:order_id',authorize('/updateOrderStatus/:order_id',"put"), async (req, res) => {
-    const { order_id } = req.params;
-    const { order_status } = req.body;
-
-    if (!order_status) {
-        return res.status(400).json({ error: "order_status is required" });
-    }
-
-    try{
-        const query = `
-            UPDATE orders
-            SET order_status = $1
-            WHERE id = $2
-            RETURNING *;
-        `;
-        const result = await pool.query(query, [order_status, order_id]);
-        if (result.rows.length === 0) {
-            return res.status(404).json({ error: "Order not found" });
-        }
-        res.status(200).json({ message: "Order status updated", order: result.rows[0] });
-    } catch (error) {
-        console.error("Error executing query:", error.message);
-        res.status(500).json({ error: "Internal Server Error" });
-    }
-});
-
-app.put('/updateStatus/:order_id/:status/',authorize('/updateStatus/:order_id/:status/',"put"), async (req, res) => {
-    const { order_id, status } = req.params;
-
-
-    if (!status) {
-        return res.status(400).json({ error: "status is required" });
-    }
-
-    try{
-        const query = `
-            UPDATE orders
-            SET status = $1
-            WHERE id = $2
-            RETURNING *;
-        `;
-        const result = await pool.query(query, [status, order_id]);
-        if (result.rows.length === 0) {
-            return res.status(404).json({ error: "Order not found" });
-        }
-        res.status(200).json({ message: "Order status updated", order: result.rows[0] });
-    } catch (error) {
-        console.error("Error executing query:", error.message);
-        res.status(500).json({ error: "Internal Server Error" });
-    }
-});
-
 app.get('/getOrdersWaiter/:waiter_id',authorize('/getOrdersWaiter/:waiter_id',"get"), async (req, res) => {
     const { waiter_id } = req.params;
     try{
@@ -527,10 +429,10 @@ app.get('/getOrdersByTable/:table_id',authorize('/getOrdersByTable/:table_id',"g
     try{
         const query = `
             SELECT * FROM orders 
-            WHERE table_id = $1 
+            WHERE table_id = $1 AND ($2::text IS NULL OR customer_id=$2)
             ORDER BY created_at DESC;
         `;
-        const result = await pool.query(query, [table_id]);
+        const result = await pool.query(query,[table_id,req.user.role==='guest'?req.user.userId:null]);
         res.status(200).json({ orders: result.rows });
     } catch (error) {
         console.error("Error executing query:", error.message);
@@ -571,96 +473,6 @@ app.get('/getOrderDetails/:order_id',authorize('/getOrderDetails/:order_id',"get
 });
 
 // Create payment
-app.post('/createPayment',authorize('/createPayment',"post"), async (req, res) => {
-    const {
-        id,
-        restaurant_id,
-        order_id,
-        order_number,
-        table_id,
-        table_name,
-        amount,
-        payment_method,
-        payment_status,
-        transaction_id,
-        notes
-    } = req.body;
-
-    if (!id || !restaurant_id || !order_id || !amount || !payment_method) {
-        return res.status(400).json({ error: "Required fields: id, restaurant_id, order_id, amount, payment_method" });
-    }
-
-    const client = await pool.connect();
-    try {
-        await client.query('BEGIN');
-
-        const query = `
-            INSERT INTO payments (
-                id, restaurant_id, order_id, order_number, table_id, table_name,
-                amount, payment_method, payment_status, transaction_id, notes,
-                created_at, updated_at
-            )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-            RETURNING *;
-        `;
-
-        const result = await client.query(query, [
-            id,
-            restaurant_id,
-            order_id,
-            order_number || null,
-            table_id || null,
-            table_name || null,
-            amount,
-            payment_method,
-            payment_status || 'Paid',
-            transaction_id || null,
-            notes || null
-        ]);
-
-        await client.query('COMMIT');
-        res.status(201).json({ payment: result.rows[0], message: "Payment created successfully" });
-    } catch (error) {
-        await client.query('ROLLBACK');
-        console.error("Error creating payment:", error.message);
-        res.status(500).json({ error: "Internal Server Error", details: error.message });
-    } finally {
-        client.release();
-    }
-});
-
-// Update order payment status
-app.put('/updateOrderPaymentStatus/:order_id',authorize('/updateOrderPaymentStatus/:order_id',"put"), async (req, res) => {
-    const { order_id } = req.params;
-    const { payment_status, payment_method } = req.body;
-
-    if (!order_id) {
-        return res.status(400).json({ error: "Order ID is required" });
-    }
-
-    try {
-        const query = `
-            UPDATE orders 
-            SET payment_status = COALESCE($1, payment_status),
-                payment_method = COALESCE($2, payment_method),
-                updated_at = CURRENT_TIMESTAMP
-            WHERE id = $3
-            RETURNING *;
-        `;
-        const result = await pool.query(query, [payment_status, payment_method, order_id]);
-        
-        if (result.rows.length === 0) {
-            return res.status(404).json({ error: "Order not found" });
-        }
-        
-        res.status(200).json({ order: result.rows[0], message: "Order payment status updated successfully" });
-    } catch (error) {
-        console.error("Error updating order payment status:", error.message);
-        res.status(500).json({ error: "Internal Server Error", details: error.message });
-    }
-});
-
-// Get payment settings for restaurant
 app.get('/getPaymentSettings/:restaurant_id',authorize('/getPaymentSettings/:restaurant_id',"get"), async (req, res) => {
     const { restaurant_id } = req.params;
     try {
@@ -982,40 +794,6 @@ app.put('/restaurant_details/updateArea',authorize('/restaurant_details/updateAr
 });
 
 
-app.delete('/deleteArea/:area_id/:restaurant_id',authorize('/deleteArea/:area_id/:restaurant_id',"delete"), async (req, res) => {
-    const { area_id, restaurant_id } = req.params;
-
-    try {
-        const checkResult = await pool.query(
-            "SELECT 1 FROM restaurant_tables WHERE area_id = $1 AND restaurant_id = $2",
-            [area_id, restaurant_id]
-        );
-
-        if (checkResult.rows.length > 0) {
-            await pool.query("DELETE FROM restaurant_tables WHERE area_id = $1 AND restaurant_id = $2", [area_id, restaurant_id]);
-        }
-
-        await pool.query(
-            "DELETE FROM restaurant_area WHERE id = $1 AND restaurant_id = $2",
-            [area_id, restaurant_id]
-        );
-
-        res.status(200).json({
-            success: true,
-            message: "Successfully deleted the area",
-            deletedAreaId: area_id
-        });
-
-    } catch (error) {
-        console.error("Error deleting area:", error.message);
-        res.status(500).json({
-            success: false,
-            error: "Internal Server Error",
-            details: error.message
-        });
-    }
-});
-
 app.put('/restaurant_details/updateTable/',authorize('/restaurant_details/updateTable/',"put"), async (req, res) => {
     const { table_id, table_name, table_capacity, table_status, restaurant_id, area_id } = req.body;
 
@@ -1038,41 +816,6 @@ app.put('/restaurant_details/updateTable/',authorize('/restaurant_details/update
 });
 
 
-app.delete('/deleteTable/:table_id/:restaurant_id',authorize('/deleteTable/:table_id/:restaurant_id',"delete"), async (req, res) => {
-    const { table_id, restaurant_id } = req.params;
-    
-    try {
-        const checkResult = await pool.query(
-            "SELECT * FROM restaurant_tables WHERE id = $1 AND restaurant_id = $2",
-            [table_id, restaurant_id]
-        );
-
-        if (checkResult.rows.length === 0) {
-            return res.status(404).json({ error: "Table not found" });
-        }
-
-        await pool.query(
-            "DELETE FROM restaurant_tables WHERE id = $1 AND restaurant_id = $2",
-            [table_id, restaurant_id]
-        );
-
-        res.status(200).json({ 
-            success: true,
-            message: "Successfully deleted the table",
-            deletedTableId: table_id
-        });
-        
-    } catch (error) {
-        console.error("Error deleting table:", error.message);
-        res.status(500).json({ 
-            success: false,
-            error: "Internal Server Error",
-            details: error.message
-        });
-    }
-});
-
-
 app.post('/restaurant_details/addTable',authorize('/restaurant_details/addTable',"post"), async (req, res) => {
     const tables = req.body;
     if (!Array.isArray(tables) || tables.length === 0) {
@@ -1087,7 +830,7 @@ app.post('/restaurant_details/addTable',authorize('/restaurant_details/addTable'
         for(const table of tables){
             const { table_id, table_name, table_capacity, table_status, restaurant_id, area_id } = table;
             if (!table_id || !table_name || !table_capacity || !table_status || !restaurant_id || !area_id) {
-                return res.status(400).json({ error: "All fields are required" });
+                throw Object.assign(new Error("All fields are required"),{status:400});
             }
 
             const checkResult = await client.query(
@@ -1105,6 +848,7 @@ app.post('/restaurant_details/addTable',authorize('/restaurant_details/addTable'
         res.status(201).json({ message: "All Tables added successfully" });
 
     }catch (error) {
+        await client.query("ROLLBACK");
         console.error("Error executing query:", error.message);
         res.status(500).json({ error: "Internal Server Error" });
     }finally{
@@ -1112,24 +856,6 @@ app.post('/restaurant_details/addTable',authorize('/restaurant_details/addTable'
     }
 
 });
-
-app.delete('/deleteMenuCategoryCompletly/:category_id',authorize('/deleteMenuCategoryCompletly/:category_id',"delete"), async (req , res) => {
-    const {category_id} = req.params;
-    if(!category_id){
-        res.status(400).json({error: "Category id is not present"})
-    }
-
-    try{
-        const data = await pool.query("select * from restaurant_menu_items where menu_category_id = $1", [category_id]);
-        if(data.rows.length > 0){
-            await pool.query("delete from restaurant_menu_items where menu_category_id = $1", [category_id]);
-        }
-        await pool.query("delete from restaurant_menu_category where id=$1", [category_id]);
-        res.status(200).send("deleted succesfuulyy");
-    }catch(e){
-        res.status(500).json({ error: "Internal Server Error" });
-    }
-})
 
 app.put('/restaurant_details/updateMenuCategoryName',authorize('/restaurant_details/updateMenuCategoryName',"put"), async(req,res) => {
     const details = req.body;
@@ -2062,21 +1788,6 @@ app.put('/superAdmin/updateRestaurantStatus/:restaurant_id',authorize('/superAdm
     }
 });
 
-app.delete('/superAdmin/deleteRestaurant/:restaurant_id',authorize('/superAdmin/deleteRestaurant/:restaurant_id',"delete"), async (req, res) => {
-    const { restaurant_id } = req.params;
-    try {
-        const query = `DELETE FROM restaurant_admin WHERE id = $1 RETURNING *;`;
-        const result = await pool.query(query, [restaurant_id]);
-        if (result.rows.length === 0) {
-            return res.status(404).json({ error: "Restaurant not found" });
-        }
-        res.status(200).json({ message: "Restaurant deleted successfully" });
-    } catch (error) {
-        console.error("Error deleting restaurant:", error.message);
-        res.status(500).json({ error: "Internal Server Error" });
-    }
-});
-
 app.get('/superAdmin/getRestaurantStats/:restaurant_id',authorize('/superAdmin/getRestaurantStats/:restaurant_id',"get"), async (req, res) => {
     const { restaurant_id } = req.params;
     try {
@@ -2185,143 +1896,8 @@ app.get('/getReservations/:restaurant_id',authorize('/getReservations/:restauran
 });
 
 // Add a new reservation
-app.post('/addReservation',authorize('/addReservation',"post"), async (req, res) => {
-    const { 
-        id, 
-        restaurant_id, 
-        customer_name, 
-        email, 
-        phone, 
-        date, 
-        time, 
-        guests, 
-        table_id, 
-        notes, 
-        status 
-    } = req.body;
-    
-    const client = await pool.connect();
-    try {
-        if (!id || !restaurant_id || !customer_name || !email || !phone || !date || !time || !guests || !table_id) {
-            return res.status(400).json({ error: "Required fields: id, restaurant_id, customer_name, email, phone, date, time, guests, table_id" });
-        }
-
-        await client.query('BEGIN');
-
-        const query = `
-            INSERT INTO reservations (
-                id, restaurant_id, customer_name, email, phone, 
-                date, time, guests, table_id, notes, status, created_at
-            ) 
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, CURRENT_TIMESTAMP)
-            RETURNING *;
-        `;
-        
-        const result = await client.query(query, [
-            id, restaurant_id, customer_name, email, phone, 
-            date, time, guests, table_id, notes || 'No special requests', status || 'pending'
-        ]);
-
-        await client.query('COMMIT');
-        res.status(201).json({ reservation: result.rows[0] });
-    } catch (error) {
-        await client.query('ROLLBACK');
-        console.error("Error executing query:", error.message);
-        console.error("Full error:", error);
-        // Return more detailed error message
-        const errorMessage = error.message.includes('foreign key') 
-            ? 'Invalid restaurant or table ID. Please check your selections.'
-            : error.message.includes('violates check constraint')
-            ? 'Invalid status value. Must be pending, success, or cancelled.'
-            : error.message;
-        res.status(500).json({ error: errorMessage || "Internal Server Error" });
-    } finally {
-        client.release();
-    }
-});
-
-// Update a reservation
-app.put('/updateReservation/:id',authorize('/updateReservation/:id',"put"), async (req, res) => {
-    const { id } = req.params;
-    const { 
-        customer_name, 
-        email, 
-        phone, 
-        date, 
-        time, 
-        guests, 
-        table_id, 
-        notes, 
-        status 
-    } = req.body;
-    
-    const client = await pool.connect();
-    try {
-        await client.query('BEGIN');
-
-        const query = `
-            UPDATE reservations 
-            SET 
-                customer_name = COALESCE($1, customer_name),
-                email = COALESCE($2, email),
-                phone = COALESCE($3, phone),
-                date = COALESCE($4, date),
-                time = COALESCE($5, time),
-                guests = COALESCE($6, guests),
-                table_id = COALESCE($7, table_id),
-                notes = COALESCE($8, notes),
-                status = COALESCE($9, status),
-                updated_at = CURRENT_TIMESTAMP
-            WHERE id = $10
-            RETURNING *;
-        `;
-        
-        const result = await client.query(query, [
-            customer_name, email, phone, date, time, guests, table_id, notes, status, id
-        ]);
-
-        if (result.rows.length === 0) {
-            await client.query('ROLLBACK');
-            return res.status(404).json({ error: "Reservation not found" });
-        }
-
-        await client.query('COMMIT');
-        res.status(200).json({ reservation: result.rows[0] });
-    } catch (error) {
-        await client.query('ROLLBACK');
-        console.error("Error executing query:", error.message);
-        res.status(500).json({ error: "Internal Server Error" });
-    } finally {
-        client.release();
-    }
-});
-
-// Delete a reservation
-app.delete('/deleteReservation/:id',authorize('/deleteReservation/:id',"delete"), async (req, res) => {
-    const { id } = req.params;
-    const client = await pool.connect();
-    try {
-        await client.query('BEGIN');
-
-        const query = 'DELETE FROM reservations WHERE id = $1 RETURNING *;';
-        const result = await client.query(query, [id]);
-
-        if (result.rows.length === 0) {
-            await client.query('ROLLBACK');
-            return res.status(404).json({ error: "Reservation not found" });
-        }
-
-        await client.query('COMMIT');
-        res.status(200).json({ message: "Reservation deleted successfully", reservation: result.rows[0] });
-    } catch (error) {
-        await client.query('ROLLBACK');
-        console.error("Error executing query:", error.message);
-        res.status(500).json({ error: "Internal Server Error" });
-    } finally {
-        client.release();
-    }
-});
-
+require('./lib/commerce').registerCommerce(app,pool,security);
+require('./lib/deletions')(app,pool,security);
 app.use((error,req,res,next)=>{if(res.headersSent)return next(error);const status=error.status||(error.code==='23503'?409:500);res.status(status).json({error:status<500?error.message:'Request could not be completed'});});
 module.exports={app,pool};
 if(require.main===module) app.listen(port, () => {
