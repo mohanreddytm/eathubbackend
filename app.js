@@ -1,3 +1,6 @@
+require('express-async-errors');
+require('dotenv').config({path:require('path').join(__dirname,'.env')});
+const {sendError}=require('./lib/errors');
 const express = require('express');
 const cors = require('cors');
 const cookieParser = require('cookie-parser');
@@ -9,13 +12,17 @@ const jwt = require('jsonwebtoken');
 
 const bcrypt = require('bcrypt');
 
-app.use(express.json());
+app.use(express.json({limit:'1mb',verify:(req,res,buf)=>{if(req.originalUrl==='/webhooks/razorpay')req.rawBody=buf;}}));
+const {rateLimit}=require('express-rate-limit');
+app.use(['/superAdminLogin','/restaurantLogin','/restaurant/waiterLogin','/restaurant/kotLogin','/loginCustomer','/addCustomer','/public/guest-session','/restaurant'],rateLimit({windowMs:900000,limit:60,standardHeaders:true,legacyHeaders:false,message:{error:'Too many attempts. Please try again later.'}}));
 app.use(cookieParser());
 
-require("dotenv").config();
+
 
 const allowedOrigins = [
   'http://localhost:3000',
+  'http://127.0.0.1:3000',
+  ...(process.env.CORS_ORIGINS || '').split(',').map(s=>s.trim()).filter(Boolean),
   'https://ptabletrack.vercel.app',
   'https://eathubfrontone.vercel.app'
 ];
@@ -25,85 +32,31 @@ app.use(cors({
     if (!origin || allowedOrigins.includes(origin)) {
       callback(null, true);
     } else {
-      callback(new Error('Not allowed by CORS'));
+      callback(Object.assign(new Error('This website is not allowed to access the service.'),{status:403}));
     }
   },
   credentials: true
 }));
 
 
-const databaseUrl = process.env.DATABASE_URL || "postgresql://neondb_owner:npg_80neSdmGjoRi@ep-morning-base-a83jvhq1-pooler.eastus2.azure.neon.tech/neondb?sslmode=require&channel_binding=require";
+const databaseUrl = process.env.DATABASE_URL;
+if (!databaseUrl) throw new Error("DATABASE_URL is required");
 
-const {Pool} = require('pg');
+const {Pool, types} = require('pg');
+// PostgreSQL DATE represents a calendar date, not an instant.
+types.setTypeParser(1082, value => value);
 const pool = new Pool({
-      connectionString: databaseUrl ,
+      connectionString: databaseUrl, connectionTimeoutMillis:10000, idleTimeoutMillis:30000,
 });
 
 
-// Helper: verify Super Admin JWT
-const verifySuperAdmin = (req, res, next) => {
-    try {
-        let token = null;
-        // Prefer Authorization bearer header
-        if (req.headers && req.headers.authorization && req.headers.authorization.startsWith('Bearer ')) {
-            token = req.headers.authorization.split(' ')[1];
-        }
-        // Fallback to cookie
-        if (!token && req.cookies && req.cookies.sa_user) {
-            token = req.cookies.sa_user;
-        }
-        if (!token) {
-            return res.status(401).json({ error: "Unauthorized: token missing" });
-        }
-        const decoded = jwt.verify(token, '10');
-        if (!decoded || decoded.role !== 'super_admin') {
-            return res.status(403).json({ error: "Forbidden: invalid role" });
-        }
-        req.superAdmin = decoded;
-        next();
-    } catch (error) {
-        console.error("Super admin auth error:", error.message);
-        return res.status(401).json({ error: "Unauthorized" });
-    }
-};
-
-// Initialize super admin credentials in database (run once after creating table)
-app.post("/superAdmin/initialize", async (req, res) => {
-    try {
-        // Check if super admin already exists
-        const checkQuery = `SELECT * FROM super_admin WHERE email = $1`;
-        const checkResult = await pool.query(checkQuery, ['superadmineathub@gmail.com']);
-        
-        if (checkResult.rows.length > 0) {
-            return res.status(200).json({ 
-                message: "Super admin already exists",
-                email: checkResult.rows[0].email
-            });
-        }
-
-        // Create super admin with hashed password
-        const hashedPassword = await bcrypt.hash('superadmin@123', 10);
-        const insertQuery = `
-            INSERT INTO super_admin (id, email, password, name)
-            VALUES ($1, $2, $3, $4)
-            RETURNING id, email, name;
-        `;
-        const result = await pool.query(insertQuery, [
-            'super_admin_001',
-            'superadmineathub@gmail.com',
-            hashedPassword,
-            'Super Admin'
-        ]);
-
-        res.status(201).json({ 
-            message: "Super admin initialized successfully",
-            admin: result.rows[0]
-        });
-    } catch (error) {
-        console.error("Error initializing super admin:", error.message);
-        res.status(500).json({ error: "Internal Server Error", details: error.message });
-    }
-});
+const {createSecurity,clean}=require('./lib/security');
+pool.on('error',e=>console.error('Database connection error:',e.code));
+const security=createSecurity(pool,jwt,process.env.JWT_SECRET);
+app.get('/health',async(req,res)=>{try{await require('./lib/readiness').checkDatabase(pool);res.json({status:'ready',version:'2.0.0'});}catch(e){sendError(e,req,res);}});
+const {authorize}=security;
+app.use((req,res,next)=>{const json=res.json.bind(res);res.json=value=>json(clean(value));next();});
+app.post('/public/guest-session',security.guestSession);
 
 app.post("/superAdminLogin", async (req, res) => {
     const { email, password } = req.body;
@@ -129,18 +82,18 @@ app.post("/superAdminLogin", async (req, res) => {
         }
 
         // Generate JWT token
-        const token = jwt.sign({ 
+        const token = security.sign({
             userId: superAdmin.id, 
             role: 'super_admin',
             email: superAdmin.email
-        }, '10', { expiresIn: '30d' });
+        });
 
         // Set httpOnly cookie
         res.cookie('sa_user', token, {
             httpOnly: true,
             sameSite: 'lax',
-            secure: false, // set true if using https
-            maxAge: 30 * 24 * 60 * 60 * 1000, // 30 days
+            secure: process.env.NODE_ENV === 'production',
+            maxAge: 12 * 60 * 60 * 1000, // 30 days
         });
 
         res.status(200).json({ 
@@ -155,7 +108,7 @@ app.post("/superAdminLogin", async (req, res) => {
         });
     } catch (error) {
         console.error("Error executing super admin login:", error.message);
-        res.status(500).json({ error: "Internal Server Error", details: error.message });
+        sendError(error,req,res);
     }
 });
 
@@ -184,12 +137,12 @@ app.post("/restaurantLogin", async (req, res) => {
             return res.status(401).json({ error: "Invalid email or password" });
         }
 
-        const token = jwt.sign({ userId: user.id }, '10', { expiresIn: '30d' });
+        const token = security.sign({userId:user.id,role:'admin',restaurantId:user.id,name:user.name});
 
         res.status(200).json({ message: "Login successful", userId: user.id, token, user: { name: user.name, email: user.email} });
     } catch (error) {
         console.error("Error executing query:", error.message);
-        res.status(500).json({ error: "Internal Server Error" });
+        sendError(error,req,res);
     }
 });
 
@@ -229,10 +182,11 @@ app.post("/restaurant/waiterLogin", async (req, res) => {
         }
 
         // Generate JWT token with waiter id and restaurant id
-        const token = jwt.sign({ 
+        await security.activeRestaurant(staff.restaurant_id);
+        const token = security.sign({
             userId: staff.id, 
-            restaurantId: staff.restaurant_id 
-        }, '10', { expiresIn: '30d' });
+            restaurantId: staff.restaurant_id, role:'waiter'
+        });
 
         res.status(200).json({ 
             message: "Login successful", 
@@ -247,7 +201,7 @@ app.post("/restaurant/waiterLogin", async (req, res) => {
         });
     } catch (error) {
         console.error("Error executing query:", error.message);
-        res.status(500).json({ error: "Internal Server Error" });
+        sendError(error,req,res);
     }
 });
 
@@ -286,10 +240,11 @@ app.post("/restaurant/kotLogin", async (req, res) => {
             return res.status(403).json({ error: "Access denied. Only chefs can login to KOT dashboard." });
         }
 
-        const token = jwt.sign({ 
+        await security.activeRestaurant(staff.restaurant_id);
+        const token = security.sign({
             userId: staff.id, 
-            restaurantId: staff.restaurant_id 
-        }, '10', { expiresIn: '30d' });
+            restaurantId: staff.restaurant_id, role:'kot'
+        });
 
         res.status(200).json({ 
             message: "Login successful", 
@@ -304,7 +259,7 @@ app.post("/restaurant/kotLogin", async (req, res) => {
         });
     } catch (error) {
         console.error("Error executing query:", error.message);
-        res.status(500).json({ error: "Internal Server Error" });
+        sendError(error,req,res);
     }
 });
 
@@ -329,18 +284,19 @@ app.post("/restaurant", async (req, res) => {
             RETURNING *;
         `;
 
+        if(typeof password!=="string" || password.length<8 || Buffer.byteLength(password)>72)return res.status(400).json({error:"Password must be 8–72 bytes long"});
         const hashedPassword = await bcrypt.hash(password, 10);
-        const values = [name, hashedPassword, email, restaurentname, branchname, branchaddress, phonenumber, id, country, countrycode, is_email_verified, is_phonenumber_verified];
+        const values = [name, hashedPassword, email, restaurentname, branchname, branchaddress, phonenumber, id, country, countrycode, false, false];
         const result = await pool.query(query, values);
 
-        const token = jwt.sign({ userId: result.rows[0].id }, '10', { expiresIn: '30d' });
+        const token = security.sign({userId:result.rows[0].id,role:'admin',restaurantId:result.rows[0].id,name:result.rows[0].name});
 
         res.status(201).json({registration_status: "Success" , user: result.rows[0], token });
 
 
     } catch (error) {
         console.error("Error executing query:", error.message);
-        res.status(500).json({registration_status: "Failure", error: "Internal Server Error" });
+        sendError(error,req,res);
     }
 });
 
@@ -357,6 +313,7 @@ app.post('/addCustomer', async (req, res) => {
         if (!id || !name || !email || !phone || !password) {
             return res.status(400).json({ error: "All fields are required" });
         }
+        if(typeof password!=="string" || password.length<8 || Buffer.byteLength(password)>72)return res.status(400).json({error:"Password must be 8–72 bytes long"});
         const hashedPassword = await bcrypt.hash(password, 10);
         const values = [id, name, email, phone, hashedPassword];
         const query = `
@@ -366,7 +323,7 @@ app.post('/addCustomer', async (req, res) => {
         res.status(201).json({ message: "Customer added successfully" });
     } catch (error) {
         console.error("Error executing query:", error.message);
-        res.status(500).json({ error: "Internal Server Error" });
+        sendError(error,req,res);
     }
 });
 
@@ -385,65 +342,16 @@ app.post('/loginCustomer', async (req, res) => {
         if (!isPasswordValid) {
             return res.status(401).json({ error: "Invalid email or password" });
         }
-        const token = jwt.sign({ userId: user.id }, '10', { expiresIn: '30d' });
+        const token = security.sign({userId:user.id,role:'customer'});
         res.status(200).json({ message: "Login successful", userId: user.id, token, user: { name: user.name, email: user.email} });
     } catch (error) {
         console.error("Error executing query:", error.message);
-        res.status(500).json({ error: "Internal Server Error" });
+        sendError(error,req,res);
     }
     }
 );
 
-app.post('/addNewOrder', async (req, res) => {
-    const { id, customer_id, table_id, restaurant_id, customer_name, items, total_price, status, waiter_id, order_status, table_name, discount_amount, tax_amount, note } = req.body;
-    const client = await pool.connect();
-    try{
-        // Allow table_id and table_name to be null (for walk-in orders)
-        if (!id || !restaurant_id || !items || !total_price || !status || !order_status) {
-            client.release();
-            return res.status(400).json({ error: "Required fields: id, restaurant_id, items, total_price, status, order_status" });
-        }
-        
-        await client.query('BEGIN');
-        
-        // Use advisory lock to prevent race conditions when calculating order number
-        const lockResult = await client.query(`SELECT hashtext($1)::bigint as lock_key`, [restaurant_id]);
-        await client.query('SELECT pg_advisory_xact_lock($1)', [lockResult.rows[0].lock_key]);
-        
-        // Efficient single query: Calculate order number and insert atomically using CTE
-        const query = `
-            WITH today_max_order AS (
-                SELECT COALESCE(MAX(order_number), 0) + 1 AS next_order_number
-                FROM orders
-                WHERE restaurant_id = $4
-                AND created_at >= CURRENT_DATE
-                AND created_at < CURRENT_DATE + INTERVAL '1 day'
-            )
-            INSERT INTO orders (id, customer_id, table_id, restaurant_id, customer_name, items, total_price, status, waiter_id, order_status, table_name, order_number, discount_amount, tax_amount, note)
-            SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, next_order_number, $12, $13, $14
-            FROM today_max_order
-            RETURNING order_number;
-        `;
-        const result = await client.query(query, [
-            id, customer_id, table_id, restaurant_id, customer_name, items, total_price, 
-            status, waiter_id, order_status, table_name, 
-            discount_amount || null, tax_amount || null, note || null
-        ]);
-        
-        await client.query('COMMIT');
-        
-        res.status(201).json({ message: "Order added successfully", order_number: result.rows[0].order_number });
-    } catch (error) {
-        await client.query('ROLLBACK').catch(() => {});
-        console.error("Error executing query:", error.message);
-        res.status(500).json({ error: "Internal Server Error", details: error.message });
-    } finally {
-        client.release();
-    }
-    }
-);
-
-app.get('/getOrderRestaurant/:restaurant_id', async (req, res) => {
+app.get('/getOrderRestaurant/:restaurant_id',authorize('/getOrderRestaurant/:restaurant_id',"get"), async (req, res) => {
     const { restaurant_id } = req.params;
     try{
         const query = `
@@ -453,83 +361,31 @@ app.get('/getOrderRestaurant/:restaurant_id', async (req, res) => {
         res.status(200).json({ order: result.rows });
     } catch (error) {
         console.error("Error executing query:", error.message);
-        res.status(500).json({ error: "Internal Server Error" });
+        sendError(error,req,res);
     }
     }
 );
 
 // Orders for KOT / kitchen dashboard - show orders that need to be cooked
-app.get('/getOrdersKitchen/:restaurant_id', async (req, res) => {
+app.get('/getOrdersKitchen/:restaurant_id',authorize('/getOrdersKitchen/:restaurant_id',"get"), async (req, res) => {
     const { restaurant_id } = req.params;
     try{
         const query = `
             SELECT * FROM orders 
             WHERE restaurant_id = $1 
-            AND order_status IN ('KOT', 'Preparing')
+            AND order_status IN ('KOT', 'Preparing', 'Ready') AND status NOT IN ('Completed','Cancelled')
             ORDER BY created_at ASC;
         `;
         const result = await pool.query(query, [restaurant_id]);
-        res.status(200).json({ order: result.rows });
+        res.status(200).json({ order: result.rows.map(o=>({...o,items:o.kot_items||o.items})) });
     } catch (error) {
         console.error("Error executing query:", error.message);
-        res.status(500).json({ error: "Internal Server Error" });
+        sendError(error,req,res);
     }
 });
 
 // Update order_status for an order (used by KOT to move through cooking stages)
-app.put('/updateOrderStatus/:order_id', async (req, res) => {
-    const { order_id } = req.params;
-    const { order_status } = req.body;
-
-    if (!order_status) {
-        return res.status(400).json({ error: "order_status is required" });
-    }
-
-    try{
-        const query = `
-            UPDATE orders
-            SET order_status = $1
-            WHERE id = $2
-            RETURNING *;
-        `;
-        const result = await pool.query(query, [order_status, order_id]);
-        if (result.rows.length === 0) {
-            return res.status(404).json({ error: "Order not found" });
-        }
-        res.status(200).json({ message: "Order status updated", order: result.rows[0] });
-    } catch (error) {
-        console.error("Error executing query:", error.message);
-        res.status(500).json({ error: "Internal Server Error" });
-    }
-});
-
-app.put('/updateStatus/:order_id/:status/', async (req, res) => {
-    const { order_id, status } = req.params;
-
-
-    if (!status) {
-        return res.status(400).json({ error: "status is required" });
-    }
-
-    try{
-        const query = `
-            UPDATE orders
-            SET status = $1
-            WHERE id = $2
-            RETURNING *;
-        `;
-        const result = await pool.query(query, [status, order_id]);
-        if (result.rows.length === 0) {
-            return res.status(404).json({ error: "Order not found" });
-        }
-        res.status(200).json({ message: "Order status updated", order: result.rows[0] });
-    } catch (error) {
-        console.error("Error executing query:", error.message);
-        res.status(500).json({ error: "Internal Server Error" });
-    }
-});
-
-app.get('/getOrdersWaiter/:waiter_id', async (req, res) => {
+app.get('/getOrdersWaiter/:waiter_id',authorize('/getOrdersWaiter/:waiter_id',"get"), async (req, res) => {
     const { waiter_id } = req.params;
     try{
         const query = `
@@ -539,12 +395,12 @@ app.get('/getOrdersWaiter/:waiter_id', async (req, res) => {
         res.status(200).json({ order: result.rows });
     } catch (error) {
         console.error("Error executing query:", error.message);
-        res.status(500).json({ error: "Internal Server Error" });
+        sendError(error,req,res);
     }
     }
 );
 
-app.get('/waiterDetailsRestaurant/:waiter_id', async (req, res) => {
+app.get('/waiterDetailsRestaurant/:waiter_id',authorize('/waiterDetailsRestaurant/:waiter_id',"get"), async (req, res) => {
     const { waiter_id } = req.params;
     try{
         const query = `
@@ -554,13 +410,13 @@ app.get('/waiterDetailsRestaurant/:waiter_id', async (req, res) => {
         res.status(200).json({ waiter: result.rows });
     } catch (error) {
         console.error("Error executing query:", error.message);
-        res.status(500).json({ error: "Internal Server Error" });
+        sendError(error,req,res);
     }
     }
 );
 
 
-app.get('/getOrderCustomer/:customer_id', async (req, res) => {
+app.get('/getOrderCustomer/:customer_id',authorize('/getOrderCustomer/:customer_id',"get"), async (req, res) => {
     const { customer_id } = req.params;
     try{
         const query = `
@@ -570,30 +426,30 @@ app.get('/getOrderCustomer/:customer_id', async (req, res) => {
         res.status(200).json({ order: result.rows });
     } catch (error) {
         console.error("Error executing query:", error.message);
-        res.status(500).json({ error: "Internal Server Error" });
+        sendError(error,req,res);
     }
     }
 );
 
 // Get orders by table_id (for customer dashboard order status)
-app.get('/getOrdersByTable/:table_id', async (req, res) => {
+app.get('/getOrdersByTable/:table_id',authorize('/getOrdersByTable/:table_id',"get"), async (req, res) => {
     const { table_id } = req.params;
     try{
         const query = `
             SELECT * FROM orders 
-            WHERE table_id = $1 
+            WHERE table_id = $1 AND ($2::text IS NULL OR customer_id=$2) AND ($3::text IS NULL OR waiter_id=$3)
             ORDER BY created_at DESC;
         `;
-        const result = await pool.query(query, [table_id]);
+        const result = await pool.query(query,[table_id,req.user.role==='guest'?req.user.userId:null,req.user.role==='waiter'?req.user.userId:null]);
         res.status(200).json({ orders: result.rows });
     } catch (error) {
         console.error("Error executing query:", error.message);
-        res.status(500).json({ error: "Internal Server Error" });
+        sendError(error,req,res);
     }
 });
 
 // Get order details by order id
-app.get('/getOrderDetails/:order_id', async (req, res) => {
+app.get('/getOrderDetails/:order_id',authorize('/getOrderDetails/:order_id',"get"), async (req, res) => {
     const { order_id } = req.params;
     try{
         if (!order_id) {
@@ -620,102 +476,12 @@ app.get('/getOrderDetails/:order_id', async (req, res) => {
         res.status(200).json({ order: [order] });
     } catch (error) {
         console.error("Error executing query:", error.message);
-        res.status(500).json({ error: "Internal Server Error", details: error.message });
+        sendError(error,req,res);
     }
 });
 
 // Create payment
-app.post('/createPayment', async (req, res) => {
-    const {
-        id,
-        restaurant_id,
-        order_id,
-        order_number,
-        table_id,
-        table_name,
-        amount,
-        payment_method,
-        payment_status,
-        transaction_id,
-        notes
-    } = req.body;
-
-    if (!id || !restaurant_id || !order_id || !amount || !payment_method) {
-        return res.status(400).json({ error: "Required fields: id, restaurant_id, order_id, amount, payment_method" });
-    }
-
-    const client = await pool.connect();
-    try {
-        await client.query('BEGIN');
-
-        const query = `
-            INSERT INTO payments (
-                id, restaurant_id, order_id, order_number, table_id, table_name,
-                amount, payment_method, payment_status, transaction_id, notes,
-                created_at, updated_at
-            )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-            RETURNING *;
-        `;
-
-        const result = await client.query(query, [
-            id,
-            restaurant_id,
-            order_id,
-            order_number || null,
-            table_id || null,
-            table_name || null,
-            amount,
-            payment_method,
-            payment_status || 'Paid',
-            transaction_id || null,
-            notes || null
-        ]);
-
-        await client.query('COMMIT');
-        res.status(201).json({ payment: result.rows[0], message: "Payment created successfully" });
-    } catch (error) {
-        await client.query('ROLLBACK');
-        console.error("Error creating payment:", error.message);
-        res.status(500).json({ error: "Internal Server Error", details: error.message });
-    } finally {
-        client.release();
-    }
-});
-
-// Update order payment status
-app.put('/updateOrderPaymentStatus/:order_id', async (req, res) => {
-    const { order_id } = req.params;
-    const { payment_status, payment_method } = req.body;
-
-    if (!order_id) {
-        return res.status(400).json({ error: "Order ID is required" });
-    }
-
-    try {
-        const query = `
-            UPDATE orders 
-            SET payment_status = COALESCE($1, payment_status),
-                payment_method = COALESCE($2, payment_method),
-                updated_at = CURRENT_TIMESTAMP
-            WHERE id = $3
-            RETURNING *;
-        `;
-        const result = await pool.query(query, [payment_status, payment_method, order_id]);
-        
-        if (result.rows.length === 0) {
-            return res.status(404).json({ error: "Order not found" });
-        }
-        
-        res.status(200).json({ order: result.rows[0], message: "Order payment status updated successfully" });
-    } catch (error) {
-        console.error("Error updating order payment status:", error.message);
-        res.status(500).json({ error: "Internal Server Error", details: error.message });
-    }
-});
-
-// Get payment settings for restaurant
-app.get('/getPaymentSettings/:restaurant_id', async (req, res) => {
+app.get('/getPaymentSettings/:restaurant_id',authorize('/getPaymentSettings/:restaurant_id',"get"), async (req, res) => {
     const { restaurant_id } = req.params;
     try {
         const query = `
@@ -744,12 +510,12 @@ app.get('/getPaymentSettings/:restaurant_id', async (req, res) => {
         res.status(200).json({ settings });
     } catch (error) {
         console.error("Error fetching payment settings:", error.message);
-        res.status(500).json({ error: "Internal Server Error", details: error.message });
+        sendError(error,req,res);
     }
 });
 
 // Update payment settings for restaurant
-app.put('/updatePaymentSettings/:restaurant_id', async (req, res) => {
+app.put('/updatePaymentSettings/:restaurant_id',authorize('/updatePaymentSettings/:restaurant_id',"put"), async (req, res) => {
     const { restaurant_id } = req.params;
     const paymentSettings = req.body;
     
@@ -769,12 +535,12 @@ app.put('/updatePaymentSettings/:restaurant_id', async (req, res) => {
         res.status(200).json({ message: "Payment settings updated successfully", settings: paymentSettings });
     } catch (error) {
         console.error("Error updating payment settings:", error.message);
-        res.status(500).json({ error: "Internal Server Error", details: error.message });
+        sendError(error,req,res);
     }
 });
 
 // Get all payments for restaurant
-app.get('/getPayments/:restaurant_id', async (req, res) => {
+app.get('/getPayments/:restaurant_id',authorize('/getPayments/:restaurant_id',"get"), async (req, res) => {
     const { restaurant_id } = req.params;
     try {
         const query = `
@@ -786,12 +552,12 @@ app.get('/getPayments/:restaurant_id', async (req, res) => {
         res.status(200).json({ payments: result.rows });
     } catch (error) {
         console.error("Error fetching payments:", error.message);
-        res.status(500).json({ error: "Internal Server Error", details: error.message });
+        sendError(error,req,res);
     }
 });
 
 // Get display settings for restaurant
-app.get('/getDisplaySettings/:restaurant_id', async (req, res) => {
+app.get('/getDisplaySettings/:restaurant_id',authorize('/getDisplaySettings/:restaurant_id',"get"), async (req, res) => {
     const { restaurant_id } = req.params;
     try {
         const query = `
@@ -819,12 +585,12 @@ app.get('/getDisplaySettings/:restaurant_id', async (req, res) => {
         res.status(200).json({ settings });
     } catch (error) {
         console.error("Error fetching display settings:", error.message);
-        res.status(500).json({ error: "Internal Server Error", details: error.message });
+        sendError(error,req,res);
     }
 });
 
 // Update display settings for restaurant
-app.put('/updateDisplaySettings/:restaurant_id', async (req, res) => {
+app.put('/updateDisplaySettings/:restaurant_id',authorize('/updateDisplaySettings/:restaurant_id',"put"), async (req, res) => {
     const { restaurant_id } = req.params;
     const displaySettings = req.body;
     
@@ -844,13 +610,13 @@ app.put('/updateDisplaySettings/:restaurant_id', async (req, res) => {
         res.status(200).json({ message: "Display settings updated successfully", settings: displaySettings });
     } catch (error) {
         console.error("Error updating display settings:", error.message);
-        res.status(500).json({ error: "Internal Server Error", details: error.message });
+        sendError(error,req,res);
     }
 });
 
 
 
-app.post("/restaurant_details/addAreas", async (req, res) => {
+app.post("/restaurant_details/addAreas",authorize("/restaurant_details/addAreas","post"), async (req, res) => {
   const areas = req.body;
 
   if (!Array.isArray(areas) || areas.length === 0) {
@@ -885,13 +651,13 @@ app.post("/restaurant_details/addAreas", async (req, res) => {
   } catch (error) {
     await client.query("ROLLBACK");
     console.error("Error inserting areas:", error.message);
-    res.status(500).json({ error: "Internal Server Error" });
+    sendError(error,req,res);
   } finally {
     client.release();
   }
 });
 
-app.get('/restaurant_details/getStaff/:restaurant_id', async (req, res) => {
+app.get('/restaurant_details/getStaff/:restaurant_id',authorize('/restaurant_details/getStaff/:restaurant_id',"get"), async (req, res) => {
     const { restaurant_id } = req.params;
 
     if (!restaurant_id) {
@@ -907,11 +673,11 @@ app.get('/restaurant_details/getStaff/:restaurant_id', async (req, res) => {
         res.status(200).json({ staff: result.rows });
     } catch (error) {
         console.error("Error fetching staff:", error.message);
-        res.status(500).json({ error: "Internal Server Error" });
+        sendError(error,req,res);
     }
 });
 
-app.delete('/restaurant_details/deleteStaff/:staff_id/:restaurant_id', async (req, res) => {
+app.delete('/restaurant_details/deleteStaff/:staff_id/:restaurant_id',authorize('/restaurant_details/deleteStaff/:staff_id/:restaurant_id',"delete"), async (req, res) => {
     const { staff_id, restaurant_id } = req.params;
 
     if (!staff_id || !restaurant_id) {
@@ -919,6 +685,8 @@ app.delete('/restaurant_details/deleteStaff/:staff_id/:restaurant_id', async (re
     }
 
     try {
+        const history = await pool.query('SELECT id FROM orders WHERE waiter_id=$1 LIMIT 1', [staff_id]);
+        if (history.rows.length) return res.status(409).json({error:'This team member has order history. Set their status to inactive instead.'});
         const query = `
             DELETE FROM restaurant_staff
             WHERE id = $1 AND restaurant_id = $2;
@@ -927,31 +695,11 @@ app.delete('/restaurant_details/deleteStaff/:staff_id/:restaurant_id', async (re
         res.status(200).json({ message: "Staff deleted successfully." });
     } catch (error) {
         console.error("Error deleting staff:", error.message);
-        res.status(500).json({ error: "Internal Server Error" });
+        sendError(error,req,res);
     }
 });
 
-app.post('/restaurant_details/addRole', async (req, res) => {
-    const { role_id, role_name, restaurant_id } = req.body;
-
-    if (!role_id || !role_name || !restaurant_id) {
-        return res.status(400).json({ error: "All fields are required" });
-    }
-
-    try {
-        const query = `
-            INSERT INTO restaurant_roles (id, role_name, restaurant_id)
-            VALUES ($1, $2, $3);
-        `;
-        await pool.query(query, [role_id, role_name, restaurant_id]);
-        res.status(201).json({ message: "Role added successfully" });
-    } catch (error) {
-        console.error("Error adding role:", error.message);
-        res.status(500).json({ error: "Internal Server Error" });
-    }
-});
-
-app.put('/restaurant_details/updateStaff', async (req, res) => {
+app.put('/restaurant_details/updateStaff',authorize('/restaurant_details/updateStaff',"put"), async (req, res) => {
     const { staff_id, staff_name, restaurant_id, staff_email,
         staff_phone, staff_salary, staff_shift_timing, staff_status, staff_address, staff_role, staff_image, staff_experience, staff_ratings, waiter_total_orders_served, waiter_assigned_tables, password} = req.body;
 
@@ -999,11 +747,11 @@ app.put('/restaurant_details/updateStaff', async (req, res) => {
         res.status(200).json({ message: "Staff updated successfully." });
     } catch (error) {
         console.error("Error updating staff:", error.message);
-        res.status(500).json({ error: "Internal Server Error", details: error.message });
+        sendError(error,req,res);
     }
 });
 
-app.post('/restaurant_details/addStaff', async(req, res) => {
+app.post('/restaurant_details/addStaff',authorize('/restaurant_details/addStaff',"post"), async(req, res) => {
     const { staff_id, staff_name, restaurant_id, staff_email, staff_phone, staff_salary, staff_shift_timing, staff_status, staff_address, staff_role, staff_image, password } = req.body;
 
     // Required fields only
@@ -1030,11 +778,11 @@ app.post('/restaurant_details/addStaff', async(req, res) => {
         res.status(201).json({ message: "Staff added successfully" });
     } catch (error) {
         console.error("Error adding staff:", error.message);
-        res.status(500).json({ error: "Internal Server Error", details: error.message });
+        sendError(error,req,res);
     }
 });
 
-app.put('/restaurant_details/updateArea', async (req, res) => {
+app.put('/restaurant_details/updateArea',authorize('/restaurant_details/updateArea',"put"), async (req, res) => {
     const { area_id, area_name, restaurant_id } = req.body;
 
     if (!area_id || !area_name || !restaurant_id) {
@@ -1051,46 +799,12 @@ app.put('/restaurant_details/updateArea', async (req, res) => {
         res.status(200).json({ message: "Area updated successfully" });
     } catch (error) {
         console.error("Error updating area:", error.message);
-        res.status(500).json({ error: "Internal Server Error" });
+        sendError(error,req,res);
     }
 });
 
 
-app.delete('/deleteArea/:area_id/:restaurant_id', async (req, res) => {
-    const { area_id, restaurant_id } = req.params;
-
-    try {
-        const checkResult = await pool.query(
-            "SELECT 1 FROM restaurant_tables WHERE area_id = $1 AND restaurant_id = $2",
-            [area_id, restaurant_id]
-        );
-
-        if (checkResult.rows.length > 0) {
-            await pool.query("DELETE FROM restaurant_tables WHERE area_id = $1 AND restaurant_id = $2", [area_id, restaurant_id]);
-        }
-
-        await pool.query(
-            "DELETE FROM restaurant_area WHERE id = $1 AND restaurant_id = $2",
-            [area_id, restaurant_id]
-        );
-
-        res.status(200).json({
-            success: true,
-            message: "Successfully deleted the area",
-            deletedAreaId: area_id
-        });
-
-    } catch (error) {
-        console.error("Error deleting area:", error.message);
-        res.status(500).json({
-            success: false,
-            error: "Internal Server Error",
-            details: error.message
-        });
-    }
-});
-
-app.put('/restaurant_details/updateTable/', async (req, res) => {
+app.put('/restaurant_details/updateTable/',authorize('/restaurant_details/updateTable/',"put"), async (req, res) => {
     const { table_id, table_name, table_capacity, table_status, restaurant_id, area_id } = req.body;
 
     if (!table_id || !table_name || !table_capacity || !table_status || !restaurant_id || !area_id) {
@@ -1107,47 +821,12 @@ app.put('/restaurant_details/updateTable/', async (req, res) => {
         res.status(200).json({ message: "Table updated successfully"});
     } catch (error) {
         console.error("Error updating table:", error.message);
-        res.status(500).json({ error: "Internal Server Error" });
+        sendError(error,req,res);
     }
 });
 
 
-app.delete('/deleteTable/:table_id/:restaurant_id', async (req, res) => {
-    const { table_id, restaurant_id } = req.params;
-    
-    try {
-        const checkResult = await pool.query(
-            "SELECT * FROM restaurant_tables WHERE id = $1 AND restaurant_id = $2",
-            [table_id, restaurant_id]
-        );
-
-        if (checkResult.rows.length === 0) {
-            return res.status(404).json({ error: "Table not found" });
-        }
-
-        await pool.query(
-            "DELETE FROM restaurant_tables WHERE id = $1 AND restaurant_id = $2",
-            [table_id, restaurant_id]
-        );
-
-        res.status(200).json({ 
-            success: true,
-            message: "Successfully deleted the table",
-            deletedTableId: table_id
-        });
-        
-    } catch (error) {
-        console.error("Error deleting table:", error.message);
-        res.status(500).json({ 
-            success: false,
-            error: "Internal Server Error",
-            details: error.message
-        });
-    }
-});
-
-
-app.post('/restaurant_details/addTable', async (req, res) => {
+app.post('/restaurant_details/addTable',authorize('/restaurant_details/addTable',"post"), async (req, res) => {
     const tables = req.body;
     if (!Array.isArray(tables) || tables.length === 0) {
         return res.status(400).json({ error: "Tables list is required" });
@@ -1161,7 +840,7 @@ app.post('/restaurant_details/addTable', async (req, res) => {
         for(const table of tables){
             const { table_id, table_name, table_capacity, table_status, restaurant_id, area_id } = table;
             if (!table_id || !table_name || !table_capacity || !table_status || !restaurant_id || !area_id) {
-                return res.status(400).json({ error: "All fields are required" });
+                throw Object.assign(new Error("All fields are required"),{status:400});
             }
 
             const checkResult = await client.query(
@@ -1179,33 +858,16 @@ app.post('/restaurant_details/addTable', async (req, res) => {
         res.status(201).json({ message: "All Tables added successfully" });
 
     }catch (error) {
+        await client.query("ROLLBACK");
         console.error("Error executing query:", error.message);
-        res.status(500).json({ error: "Internal Server Error" });
+        sendError(error,req,res);
     }finally{
         client.release();
     }
 
 });
 
-app.delete('/deleteMenuCategoryCompletly/:category_id', async (req , res) => {
-    const {category_id} = req.params;
-    if(!category_id){
-        res.status(400).json({error: "Category id is not present"})
-    }
-
-    try{
-        const data = await pool.query("select * from restaurant_menu_items where menu_category_id = $1", [category_id]);
-        if(data.rows.length > 0){
-            await pool.query("delete from restaurant_menu_items where menu_category_id = $1", [category_id]);
-        }
-        await pool.query("delete from restaurant_menu_category where id=$1", [category_id]);
-        res.status(200).send("deleted succesfuulyy");
-    }catch(e){
-        res.status(500).json({ error: "Internal Server Error" });
-    }
-})
-
-app.put('/restaurant_details/updateMenuCategoryName', async(req,res) => {
+app.put('/restaurant_details/updateMenuCategoryName',authorize('/restaurant_details/updateMenuCategoryName',"put"), async(req,res) => {
     const details = req.body;
     const {menu_category_name, id} = details;
     if(!menu_category_name || !id){
@@ -1221,12 +883,12 @@ app.put('/restaurant_details/updateMenuCategoryName', async(req,res) => {
 
         res.status(200).send("Done");
     }
-    catch{
-        res.status(500).json({ error: "Internal Server Error" });
+    catch(error){
+        sendError(error,req,res);
     }
 })
 
-app.post('/restaurant_details/addMenuCategory', async (req, res) => {
+app.post('/restaurant_details/addMenuCategory',authorize('/restaurant_details/addMenuCategory',"post"), async (req, res) => {
     const categories = req.body;
 
     if (!Array.isArray(categories) || categories.length === 0) {
@@ -1265,14 +927,14 @@ app.post('/restaurant_details/addMenuCategory', async (req, res) => {
     } catch (error) {
         await client.query("ROLLBACK");
         console.error("Error inserting menu categories:", error.message);
-        res.status(500).json({ error: "Internal Server Error" });
+        sendError(error,req,res);
     } finally {
         client.release();
     }
 });
 
 
-app.get('/getMenuItems/:restaurant_id', async (req, res) => {
+app.get('/getMenuItems/:restaurant_id',authorize('/getMenuItems/:restaurant_id',"get"), async (req, res) => {
     const restaurant_id = req.params.restaurant_id;
     const query = 'SELECT * FROM restaurant_menu_items WHERE restaurant_id = $1';
     const result = await pool.query(query, [restaurant_id]);
@@ -1282,7 +944,7 @@ app.get('/getMenuItems/:restaurant_id', async (req, res) => {
 
 
 
-app.delete('/deleteMenuItem/:item_id/:restaurant_id', async (req , res) => {
+app.delete('/deleteMenuItem/:item_id/:restaurant_id',authorize('/deleteMenuItem/:item_id/:restaurant_id',"delete"), async (req , res) => {
     const {item_id, restaurant_id} = req.params;
     if(!item_id || !restaurant_id){
         return res.status(400).json({error: "All feilds are required"});
@@ -1291,12 +953,12 @@ app.delete('/deleteMenuItem/:item_id/:restaurant_id', async (req , res) => {
     try{
         await pool.query("delete from restaurant_menu_items where id = $1 and restaurant_id = $2;", [item_id, restaurant_id]);
         res.status(200).send("Succesfully Deleted the Item")
-    }catch{
-        res.status(500).json({ error: "Internal Server Error" });
+    }catch(error){
+        sendError(error,req,res);
     }
 })
 
-app.put('/restaurant_details/updateMenuItem', async (req, res) => {
+app.put('/restaurant_details/updateMenuItem',authorize('/restaurant_details/updateMenuItem',"put"), async (req, res) => {
     const { item_id, item_name, item_dec, category_name, item_price, item_menu_category_id, item_category, item_url, item_availabiliy, item_preparation_time, restaurant_id } = req.body;
     if (!item_id || !item_name || !item_dec || !category_name || !item_price || !item_menu_category_id || !item_category || !item_availabiliy || !item_preparation_time || !restaurant_id) {
         return res.status(400).json({ error: "All fields are required" });
@@ -1332,13 +994,13 @@ app.put('/restaurant_details/updateMenuItem', async (req, res) => {
     } catch (error) {
         await client.query("ROLLBACK");
         console.error("Error updating menu item:", error.message);
-        res.status(500).json({ error: "Internal Server Error" });
+        sendError(error,req,res);
     } finally {
         client.release();
     }
 });
 
-app.get('/restaurant_details/getMenuCategory/:restaurant_id', async (req, res) => {
+app.get('/restaurant_details/getMenuCategory/:restaurant_id',authorize('/restaurant_details/getMenuCategory/:restaurant_id',"get"), async (req, res) => {
     const restaurant_id = req.params.restaurant_id;
 
     const query = "SELECT c.id, c.menu_category_name, COUNT(i.menu_category_id) AS item_count FROM restaurant_menu_category c LEFT JOIN restaurant_menu_items i ON c.id = i.menu_category_id WHERE c.restaurant_id=$1 GROUP BY c.menu_category_name, c.id;";
@@ -1346,7 +1008,7 @@ app.get('/restaurant_details/getMenuCategory/:restaurant_id', async (req, res) =
     res.status(200).json(result.rows);
 });
 
-app.post('/restaurant_details/addMenuItems', async (req, res) => {
+app.post('/restaurant_details/addMenuItems',authorize('/restaurant_details/addMenuItems',"post"), async (req, res) => {
     const items = req.body;
 
     if (!Array.isArray(items) || items.length === 0) {
@@ -1416,7 +1078,7 @@ app.post('/restaurant_details/addMenuItems', async (req, res) => {
     } catch (error) {
         await client.query("ROLLBACK");
         console.error("Error inserting menu items:", error.message);
-        res.status(500).json({ error: "Internal Server Error" });
+        sendError(error,req,res);
     } finally {
         client.release();
     }
@@ -1428,7 +1090,7 @@ app.post('/restaurant_details/addMenuItems', async (req, res) => {
 
 // Create a new waiter request (called from customer dashboard "Call Waiter")
 // Auto-assigns to top available waiter
-app.post('/createWaiterRequest', async (req, res) => {
+app.post('/createWaiterRequest',authorize('/createWaiterRequest',"post"), async (req, res) => {
     const {
         id,
         restaurant_id,
@@ -1491,7 +1153,7 @@ app.post('/createWaiterRequest', async (req, res) => {
                    AND wr.status IN ('pending', 'assigned')
                 WHERE rs.restaurant_id = $1
                   AND LOWER(COALESCE(rs.role, '')) LIKE '%waiter%'
-                  AND (rs.status IS NULL OR LOWER(rs.status) NOT LIKE '%busy%')
+                  AND LOWER(COALESCE(rs.status,'active')) IN ('active','available','serving')
                 GROUP BY rs.id
             ),
             min_count AS (
@@ -1552,14 +1214,14 @@ app.post('/createWaiterRequest', async (req, res) => {
     } catch (error) {
         await client.query('ROLLBACK');
         console.error("Error creating waiter request:", error.message);
-        res.status(500).json({ error: "Internal Server Error" });
+        sendError(error,req,res);
     } finally {
         client.release();
     }
 });
 
 // Get all pending waiter requests for a restaurant (used in restaurant dashboard WaiterRequest page)
-app.get('/getPendingWaiterRequests/:restaurant_id', async (req, res) => {
+app.get('/getPendingWaiterRequests/:restaurant_id',authorize('/getPendingWaiterRequests/:restaurant_id',"get"), async (req, res) => {
     const { restaurant_id } = req.params;
 
     if (!restaurant_id) {
@@ -1575,7 +1237,7 @@ app.get('/getPendingWaiterRequests/:restaurant_id', async (req, res) => {
             LEFT JOIN restaurant_staff rs
                 ON wr.assigned_waiter_id = rs.id
             WHERE wr.restaurant_id = $1
-              AND wr.status = 'pending'
+              AND wr.status IN ('pending','assigned')
             ORDER BY wr.created_at DESC;
         `;
 
@@ -1583,12 +1245,12 @@ app.get('/getPendingWaiterRequests/:restaurant_id', async (req, res) => {
         res.status(200).json({ requests: result.rows });
     } catch (error) {
         console.error("Error fetching pending waiter requests:", error.message);
-        res.status(500).json({ error: "Internal Server Error" });
+        sendError(error,req,res);
     }
 });
 
 // Get waiters with their current status and number of assigned pending requests
-app.get('/getWaitersWithStatus/:restaurant_id', async (req, res) => {
+app.get('/getWaitersWithStatus/:restaurant_id',authorize('/getWaitersWithStatus/:restaurant_id',"get"), async (req, res) => {
     const { restaurant_id } = req.params;
 
     if (!restaurant_id) {
@@ -1603,7 +1265,7 @@ app.get('/getWaitersWithStatus/:restaurant_id', async (req, res) => {
             FROM restaurant_staff rs
             LEFT JOIN waiter_requests wr
                 ON wr.assigned_waiter_id = rs.id
-               AND wr.status = 'pending'
+               AND wr.status IN ('pending','assigned')
             WHERE rs.restaurant_id = $1
               AND LOWER(COALESCE(rs.role, '')) LIKE '%waiter%'
             GROUP BY rs.id
@@ -1614,12 +1276,12 @@ app.get('/getWaitersWithStatus/:restaurant_id', async (req, res) => {
         res.status(200).json({ waiters: result.rows });
     } catch (error) {
         console.error("Error fetching waiters with status:", error.message);
-        res.status(500).json({ error: "Internal Server Error" });
+        sendError(error,req,res);
     }
 });
 
 // Assign a waiter to a specific waiter request
-app.put('/assignWaiterToRequest/:request_id', async (req, res) => {
+app.put('/assignWaiterToRequest/:request_id',authorize('/assignWaiterToRequest/:request_id',"put"), async (req, res) => {
     const { request_id } = req.params;
     const { waiter_id } = req.body;
 
@@ -1646,7 +1308,7 @@ app.put('/assignWaiterToRequest/:request_id', async (req, res) => {
         res.status(200).json({ message: "Waiter assigned successfully", request: result.rows[0] });
     } catch (error) {
         console.error("Error assigning waiter to request:", error.message);
-        res.status(500).json({ error: "Internal Server Error" });
+        sendError(error,req,res);
     }
 });
 
@@ -1655,7 +1317,7 @@ app.put('/assignWaiterToRequest/:request_id', async (req, res) => {
 // ===========================
 
 // Create a new admin call to a waiter
-app.post('/createAdminCall', async (req, res) => {
+app.post('/createAdminCall',authorize('/createAdminCall',"post"), async (req, res) => {
     const {
         id,
         restaurant_id,
@@ -1699,12 +1361,12 @@ app.post('/createAdminCall', async (req, res) => {
         res.status(201).json({ message: "Admin call created successfully" });
     } catch (error) {
         console.error("Error creating admin call:", error.message);
-        res.status(500).json({ error: "Internal Server Error" });
+        sendError(error,req,res);
     }
 });
 
 // Get pending admin calls for a specific waiter (used in waiter dashboard)
-app.get('/getPendingAdminCallsWaiter/:waiter_id', async (req, res) => {
+app.get('/getPendingAdminCallsWaiter/:waiter_id',authorize('/getPendingAdminCallsWaiter/:waiter_id',"get"), async (req, res) => {
     const { waiter_id } = req.params;
 
     if (!waiter_id) {
@@ -1724,12 +1386,12 @@ app.get('/getPendingAdminCallsWaiter/:waiter_id', async (req, res) => {
         res.status(200).json({ calls: result.rows });
     } catch (error) {
         console.error("Error fetching admin calls for waiter:", error.message);
-        res.status(500).json({ error: "Internal Server Error" });
+        sendError(error,req,res);
     }
 });
 
 // Get recent admin calls for a restaurant (used in restaurant dashboard if needed)
-app.get('/getAdminCallsRestaurant/:restaurant_id', async (req, res) => {
+app.get('/getAdminCallsRestaurant/:restaurant_id',authorize('/getAdminCallsRestaurant/:restaurant_id',"get"), async (req, res) => {
     const { restaurant_id } = req.params;
 
     if (!restaurant_id) {
@@ -1749,12 +1411,12 @@ app.get('/getAdminCallsRestaurant/:restaurant_id', async (req, res) => {
         res.status(200).json({ calls: result.rows });
     } catch (error) {
         console.error("Error fetching admin calls for restaurant:", error.message);
-        res.status(500).json({ error: "Internal Server Error" });
+        sendError(error,req,res);
     }
 });
 
 // Update admin call status (e.g., answered, missed, cancelled)
-app.put('/updateAdminCallStatus/:id', async (req, res) => {
+app.put('/updateAdminCallStatus/:id',authorize('/updateAdminCallStatus/:id',"put"), async (req, res) => {
     const { id } = req.params;
     const { status } = req.body;
 
@@ -1785,19 +1447,20 @@ app.put('/updateAdminCallStatus/:id', async (req, res) => {
         res.status(200).json({ message: "Admin call updated successfully", call: result.rows[0] });
     } catch (error) {
         console.error("Error updating admin call status:", error.message);
-        res.status(500).json({ error: "Internal Server Error" });
+        sendError(error,req,res);
     }
 });
 
 // Update waiter status (e.g., available, serving, busy)
 // If setting to busy, reassign pending requests to next waiter
-app.put('/updateWaiterStatus/:waiter_id', async (req, res) => {
+app.put('/updateWaiterStatus/:waiter_id',authorize('/updateWaiterStatus/:waiter_id',"put"), async (req, res) => {
     const { waiter_id } = req.params;
     const { status } = req.body;
 
     if (!waiter_id || !status) {
         return res.status(400).json({ error: "Required fields: waiter_id, status" });
     }
+    if (!['available','serving','busy'].includes(status)) return res.status(400).json({error:'Choose available, serving, or busy.'});
 
     const client = await pool.connect();
     try {
@@ -1834,11 +1497,11 @@ app.put('/updateWaiterStatus/:waiter_id', async (req, res) => {
                     FROM restaurant_staff rs
                     LEFT JOIN waiter_requests wr
                         ON wr.assigned_waiter_id = rs.id
-                       AND wr.status = 'pending'
+                       AND wr.status IN ('pending','assigned')
                     WHERE rs.restaurant_id = $1
                       AND rs.id != $2
                       AND LOWER(COALESCE(rs.role, '')) LIKE '%waiter%'
-                      AND (rs.status IS NULL OR LOWER(rs.status) NOT LIKE '%busy%')
+                      AND LOWER(COALESCE(rs.status,'active')) IN ('active','available','serving')
                     GROUP BY rs.id
                     ORDER BY 
                         CASE 
@@ -1869,6 +1532,8 @@ app.put('/updateWaiterStatus/:waiter_id', async (req, res) => {
                             [nextWaiter.id]
                         );
                     }
+                } else {
+                    await client.query("UPDATE waiter_requests SET assigned_waiter_id=NULL,status='pending',updated_at=CURRENT_TIMESTAMP WHERE id=$1", [request.id]);
                 }
             }
         }
@@ -1893,14 +1558,14 @@ app.put('/updateWaiterStatus/:waiter_id', async (req, res) => {
     } catch (error) {
         await client.query('ROLLBACK');
         console.error("Error updating waiter status:", error.message);
-        res.status(500).json({ error: "Internal Server Error" });
+        sendError(error,req,res);
     } finally {
         client.release();
     }
 });
 
 // Mark waiter request as completed and move waiter to end of list
-app.put('/completeWaiterRequest/:request_id', async (req, res) => {
+app.put('/completeWaiterRequest/:request_id',authorize('/completeWaiterRequest/:request_id',"put"), async (req, res) => {
     const { request_id } = req.params;
 
     try {
@@ -1956,7 +1621,7 @@ app.put('/completeWaiterRequest/:request_id', async (req, res) => {
         }
     } catch (error) {
         console.error("Error completing waiter request:", error.message);
-        res.status(500).json({ error: "Internal Server Error" });
+        sendError(error,req,res);
     }
 });
 
@@ -1965,7 +1630,7 @@ app.put('/completeWaiterRequest/:request_id', async (req, res) => {
 // ===========================
 
 // Get chat messages for a restaurant
-app.get('/restaurant_messages/:restaurant_id', async (req, res) => {
+app.get('/restaurant_messages/:restaurant_id',authorize('/restaurant_messages/:restaurant_id',"get"), async (req, res) => {
     const { restaurant_id } = req.params;
 
     if (!restaurant_id) {
@@ -1984,12 +1649,12 @@ app.get('/restaurant_messages/:restaurant_id', async (req, res) => {
         res.status(200).json({ messages: result.rows });
     } catch (error) {
         console.error("Error fetching restaurant messages:", error.message);
-        res.status(500).json({ error: "Internal Server Error" });
+        sendError(error,req,res);
     }
 });
 
 // Post a new chat message (admin or waiter)
-app.post('/restaurant_messages', async (req, res) => {
+app.post('/restaurant_messages',authorize('/restaurant_messages',"post"), async (req, res) => {
     const {
         id,
         restaurant_id,
@@ -2029,12 +1694,12 @@ app.post('/restaurant_messages', async (req, res) => {
         res.status(201).json({ message: "Chat message created successfully" });
     } catch (error) {
         console.error("Error creating restaurant message:", error.message);
-        res.status(500).json({ error: "Internal Server Error" });
+        sendError(error,req,res);
     }
 });
 
 // Super Admin logout endpoint
-app.post('/superAdmin/logout', verifySuperAdmin, async (req, res) => {
+app.post('/superAdmin/logout',authorize('/superAdmin/logout',"post"), async (req, res) => {
     try {
         // Clear the HttpOnly cookie
         res.clearCookie('sa_user', {
@@ -2050,7 +1715,7 @@ app.post('/superAdmin/logout', verifySuperAdmin, async (req, res) => {
 });
 
 // Super Admin endpoints
-app.get('/superAdmin/getAllRestaurants', verifySuperAdmin, async (req, res) => {
+app.get('/superAdmin/getAllRestaurants',authorize('/superAdmin/getAllRestaurants',"get"), async (req, res) => {
     try {
         // Try to get columns, use COALESCE to default to true/false if columns don't exist
         const query = `
@@ -2085,12 +1750,12 @@ app.get('/superAdmin/getAllRestaurants', verifySuperAdmin, async (req, res) => {
             res.status(200).json({ restaurants: restaurantsWithDefaults });
         } catch (fallbackError) {
             console.error("Error in fallback query:", fallbackError.message);
-            res.status(500).json({ error: "Internal Server Error" });
+            sendError(error,req,res);
         }
     }
 });
 
-app.put('/superAdmin/updateRestaurantStatus/:restaurant_id', verifySuperAdmin, async (req, res) => {
+app.put('/superAdmin/updateRestaurantStatus/:restaurant_id',authorize('/superAdmin/updateRestaurantStatus/:restaurant_id',"put"), async (req, res) => {
     const { restaurant_id } = req.params;
     const { is_active, is_suspended } = req.body;
     try {
@@ -2132,26 +1797,11 @@ app.put('/superAdmin/updateRestaurantStatus/:restaurant_id', verifySuperAdmin, a
         res.status(200).json({ message: "Restaurant status updated successfully", restaurant: result.rows[0] });
     } catch (error) {
         console.error("Error updating restaurant status:", error.message);
-        res.status(500).json({ error: "Internal Server Error" });
+        sendError(error,req,res);
     }
 });
 
-app.delete('/superAdmin/deleteRestaurant/:restaurant_id', verifySuperAdmin, async (req, res) => {
-    const { restaurant_id } = req.params;
-    try {
-        const query = `DELETE FROM restaurant_admin WHERE id = $1 RETURNING *;`;
-        const result = await pool.query(query, [restaurant_id]);
-        if (result.rows.length === 0) {
-            return res.status(404).json({ error: "Restaurant not found" });
-        }
-        res.status(200).json({ message: "Restaurant deleted successfully" });
-    } catch (error) {
-        console.error("Error deleting restaurant:", error.message);
-        res.status(500).json({ error: "Internal Server Error" });
-    }
-});
-
-app.get('/superAdmin/getRestaurantStats/:restaurant_id', verifySuperAdmin, async (req, res) => {
+app.get('/superAdmin/getRestaurantStats/:restaurant_id',authorize('/superAdmin/getRestaurantStats/:restaurant_id',"get"), async (req, res) => {
     const { restaurant_id } = req.params;
     try {
         // Get order count
@@ -2170,9 +1820,7 @@ app.get('/superAdmin/getRestaurantStats/:restaurant_id', verifySuperAdmin, async
         const tablesResult = await pool.query(
             `SELECT COUNT(*) as total_tables 
              FROM restaurant_tables 
-             WHERE restaurant_id IN (
-                 SELECT id FROM restaurant_area WHERE restaurant_id = $1
-             )`,
+             WHERE restaurant_id = $1`,
             [restaurant_id]
         );
 
@@ -2183,11 +1831,11 @@ app.get('/superAdmin/getRestaurantStats/:restaurant_id', verifySuperAdmin, async
         });
     } catch (error) {
         console.error("Error fetching restaurant stats:", error.message);
-        res.status(500).json({ error: "Internal Server Error" });
+        sendError(error,req,res);
     }
 });
 
-app.get('/getTableName/:table_id', async (req, res) => {
+app.get('/getTableName/:table_id',authorize('/getTableName/:table_id',"get"), async (req, res) => {
     const table_id = req.params.table_id;
     try{
         const result = await pool.query("SELECT * from restaurant_tables where id = $1", [table_id]);
@@ -2197,14 +1845,14 @@ app.get('/getTableName/:table_id', async (req, res) => {
     }
 })
 
-app.get('/getTables/:area_id', async (req, res) => {
+app.get('/getTables/:area_id',authorize('/getTables/:area_id',"get"), async (req, res) => {
     const area_id = req.params.area_id;
     const query = 'SELECT * FROM restaurant_tables WHERE area_id = $1';
     const result = await pool.query(query, [area_id]);
     res.status(200).json(result.rows);
 });
 
-app.get('/getAreas/:restaurant_id', async (req, res) => {
+app.get('/getAreas/:restaurant_id',authorize('/getAreas/:restaurant_id',"get"), async (req, res) => {
     const restaurant_id = req.params.restaurant_id;
     const query = 'SELECT * FROM restaurant_area WHERE restaurant_id = $1';
     const result = await pool.query(query, [restaurant_id]);
@@ -2213,27 +1861,27 @@ app.get('/getAreas/:restaurant_id', async (req, res) => {
 
 
 
-app.get("/restaurant/:id", async (req, res) => {
+app.get("/restaurant/:id",authorize("/restaurant/:id","get"), async (req, res) => {
     try {
         const id = req.params.id;
-        const query = 'SELECT * FROM restaurant_admin WHERE id = $1';
+        const query = req.user.role === 'guest' ? 'SELECT id,restaurentname,branchname,branchaddress,country FROM restaurant_admin WHERE id=$1' : 'SELECT * FROM restaurant_admin WHERE id=$1';
         const result = await pool.query(query, [id]);
         res.json(result.rows); // send the data as JSON
     } catch (error) {
         console.error("Got an error:", error);
-        res.status(500).send("Server error");
+        sendError(error,req,res);
     }
 });
 
 
-app.get("/restaurant", async (req, res) => {
+app.get("/restaurant",authorize("/restaurant","get"), async (req, res) => {
     const url = "select * from restaurant_admin;";
     try {
         const result = await pool.query(url);
         res.status(200).json(result.rows);
     } catch (error) {
         console.error("Error executing query", error);
-        res.status(500).json({ error: "Internal Server Error" });
+        sendError(error,req,res);
     }
 });
 
@@ -2244,7 +1892,7 @@ app.get("/ping", (req, res) => {
 // Reservation API Endpoints
 
 // Get all reservations for a restaurant
-app.get('/getReservations/:restaurant_id', async (req, res) => {
+app.get('/getReservations/:restaurant_id',authorize('/getReservations/:restaurant_id',"get"), async (req, res) => {
     const { restaurant_id } = req.params;
     try {
         const query = `
@@ -2256,151 +1904,17 @@ app.get('/getReservations/:restaurant_id', async (req, res) => {
         res.status(200).json({ reservations: result.rows });
     } catch (error) {
         console.error("Error executing query:", error.message);
-        res.status(500).json({ error: "Internal Server Error" });
+        sendError(error,req,res);
     }
 });
 
 // Add a new reservation
-app.post('/addReservation', async (req, res) => {
-    const { 
-        id, 
-        restaurant_id, 
-        customer_name, 
-        email, 
-        phone, 
-        date, 
-        time, 
-        guests, 
-        table_id, 
-        notes, 
-        status 
-    } = req.body;
-    
-    const client = await pool.connect();
-    try {
-        if (!id || !restaurant_id || !customer_name || !email || !phone || !date || !time || !guests || !table_id) {
-            client.release();
-            return res.status(400).json({ error: "Required fields: id, restaurant_id, customer_name, email, phone, date, time, guests, table_id" });
-        }
-
-        await client.query('BEGIN');
-
-        const query = `
-            INSERT INTO reservations (
-                id, restaurant_id, customer_name, email, phone, 
-                date, time, guests, table_id, notes, status, created_at
-            ) 
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, CURRENT_TIMESTAMP)
-            RETURNING *;
-        `;
-        
-        const result = await client.query(query, [
-            id, restaurant_id, customer_name, email, phone, 
-            date, time, guests, table_id, notes || 'No special requests', status || 'pending'
-        ]);
-
-        await client.query('COMMIT');
-        res.status(201).json({ reservation: result.rows[0] });
-    } catch (error) {
-        await client.query('ROLLBACK');
-        console.error("Error executing query:", error.message);
-        console.error("Full error:", error);
-        // Return more detailed error message
-        const errorMessage = error.message.includes('foreign key') 
-            ? 'Invalid restaurant or table ID. Please check your selections.'
-            : error.message.includes('violates check constraint')
-            ? 'Invalid status value. Must be pending, success, or cancelled.'
-            : error.message;
-        res.status(500).json({ error: errorMessage || "Internal Server Error" });
-    } finally {
-        client.release();
-    }
-});
-
-// Update a reservation
-app.put('/updateReservation/:id', async (req, res) => {
-    const { id } = req.params;
-    const { 
-        customer_name, 
-        email, 
-        phone, 
-        date, 
-        time, 
-        guests, 
-        table_id, 
-        notes, 
-        status 
-    } = req.body;
-    
-    const client = await pool.connect();
-    try {
-        await client.query('BEGIN');
-
-        const query = `
-            UPDATE reservations 
-            SET 
-                customer_name = COALESCE($1, customer_name),
-                email = COALESCE($2, email),
-                phone = COALESCE($3, phone),
-                date = COALESCE($4, date),
-                time = COALESCE($5, time),
-                guests = COALESCE($6, guests),
-                table_id = COALESCE($7, table_id),
-                notes = COALESCE($8, notes),
-                status = COALESCE($9, status),
-                updated_at = CURRENT_TIMESTAMP
-            WHERE id = $10
-            RETURNING *;
-        `;
-        
-        const result = await client.query(query, [
-            customer_name, email, phone, date, time, guests, table_id, notes, status, id
-        ]);
-
-        if (result.rows.length === 0) {
-            await client.query('ROLLBACK');
-            client.release();
-            return res.status(404).json({ error: "Reservation not found" });
-        }
-
-        await client.query('COMMIT');
-        res.status(200).json({ reservation: result.rows[0] });
-    } catch (error) {
-        await client.query('ROLLBACK');
-        console.error("Error executing query:", error.message);
-        res.status(500).json({ error: "Internal Server Error" });
-    } finally {
-        client.release();
-    }
-});
-
-// Delete a reservation
-app.delete('/deleteReservation/:id', async (req, res) => {
-    const { id } = req.params;
-    const client = await pool.connect();
-    try {
-        await client.query('BEGIN');
-
-        const query = 'DELETE FROM reservations WHERE id = $1 RETURNING *;';
-        const result = await client.query(query, [id]);
-
-        if (result.rows.length === 0) {
-            await client.query('ROLLBACK');
-            client.release();
-            return res.status(404).json({ error: "Reservation not found" });
-        }
-
-        await client.query('COMMIT');
-        res.status(200).json({ message: "Reservation deleted successfully", reservation: result.rows[0] });
-    } catch (error) {
-        await client.query('ROLLBACK');
-        console.error("Error executing query:", error.message);
-        res.status(500).json({ error: "Internal Server Error" });
-    } finally {
-        client.release();
-    }
-});
-
-app.listen(port, () => {
+const commerce=require('./lib/commerce').registerCommerce(app,pool,security);
+require('./lib/gateway').registerGateway(app,pool,security,commerce.settle);
+require('./lib/workspace')(app,pool,security);
+require('./lib/deletions')(app,pool,security);
+app.use((error,req,res,next)=>{if(res.headersSent)return next(error);return sendError(error,req,res);});
+module.exports={app,pool};
+if(require.main===module) app.listen(port, () => {
     console.log(`Server is running on http://localhost:${port}`);
 });

@@ -5,6 +5,8 @@
     "cors": "^2.8.5",
     "dotenv": "^17.0.0",
     "express": "^4.18.2",
+    "express-async-errors": "^3.1.1",
+    "express-rate-limit": "^8.7.0",
     "js-cookie": "^3.0.5",
     "jsonwebtoken": "^9.0.2",
     "node-fetch": "^3.3.2",
@@ -15,10 +17,21 @@
   "version": "1.0.0",
   "main": "app.js",
   "scripts": {
-    "start": "node app.js"
+    "start": "node app.js",
+    "test": "node --test test/*.test.js",
+    "dev": "nodemon app.js",
+    "db:check": "node scripts/database.js",
+    "db:migrate": "node scripts/database.js --migrate",
+    "demo": "node scripts/demo.js"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
-  "description": ""
+  "description": "",
+  "devDependencies": {
+    "@electric-sql/pglite": "^0.5.8"
+  },
+  "engines": {
+    "node": ">=20"
+  }
 }
