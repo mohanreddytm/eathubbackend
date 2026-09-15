@@ -45,7 +45,7 @@ before(async () => {
   await db.exec(fs.readFileSync(__dirname + "/schema.sql", "utf8"));
   await db.exec(
     fs.readFileSync(
-      __dirname + "/../migrations/001_audit_integrity.sql",
+      __dirname + "/../migrations/002_schema_compatibility.sql",
       "utf8",
     ),
   );
@@ -443,4 +443,246 @@ test("extra KOT after ready sends only the new items to the kitchen", async () =
   const bill = (await api("GET", "/generateBill/kot-test", admin)).body.bill;
   assert.equal(bill.items.length, 2);
   assert.equal(bill.total, 300);
+});
+
+test("workspace routes return scoped data for all staff roles and recover legacy item names", async () => {
+  const a = await api("GET", "/workspace", admin);
+  assert.equal(a.status, 200);
+  assert.equal(a.body.restaurant.password, undefined);
+  assert.equal(a.body.restaurant.id, "r1");
+  const w = await api("GET", "/workspace", waiter);
+  assert.equal(w.status, 200);
+  assert.ok(w.body.orders.every((o) => o.waiter_id === "w1"));
+  assert.ok(w.body.staff.every((s) => !s.email && !s.salary && !s.password));
+  const k = await api("GET", "/workspace", kitchen);
+  assert.equal(k.status, 200);
+  assert.ok(
+    k.body.orders.every((o) => !["Completed", "Cancelled"].includes(o.status)),
+  );
+  assert.equal((await api("GET", "/workspace", guest)).status, 403);
+  const o = await api("POST", "/addNewOrder", admin, {
+    id: "legacy-name",
+    restaurant_id: "r1",
+    items: [{ id: "m1", quantity: 1 }],
+    tax_percent: 5,
+    tax_mode: "inclusive",
+  });
+  assert.equal(o.status, 200);
+  await db.query(
+    'UPDATE orders SET items=\'[{"id":"m1","price":100,"quantity":1}]\' WHERE id=\'legacy-name\'',
+  );
+  const bill = await api("GET", "/generateBill/legacy-name", admin);
+  assert.equal(bill.status, 200);
+  assert.equal(bill.body.bill.items[0].name, "Meal");
+  assert.equal(bill.body.bill.tax_mode, "inclusive");
+  assert.equal(bill.body.bill.total, 100);
+  const unknown = await api("GET", "/generateBill/does-not-exist", admin);
+  assert.equal(unknown.status, 404);
+});
+test("admin management contract supports category, menu, area, table, staff and profile writes", async () => {
+  const r = "r1";
+  let result = await api("POST", "/restaurant_details/addMenuCategory", admin, [
+    {
+      menu_category_id: "crud-cat",
+      menu_category_name: "Breakfast",
+      restaurant_id: r,
+    },
+  ]);
+  assert.equal(result.status, 201);
+  const item = {
+    item_id: "crud-item",
+    item_name: "Dosa",
+    item_dec: "Plain dosa",
+    category_name: "Breakfast",
+    item_price: "80",
+    item_menu_category_id: "crud-cat",
+    item_category: "Veg",
+    item_url: "",
+    item_availabiliy: "Yes",
+    item_preparation_time: "10",
+    restaurant_id: r,
+  };
+  assert.equal(
+    (await api("POST", "/restaurant_details/addMenuItems", admin, [item]))
+      .status,
+    201,
+  );
+  assert.equal(
+    (
+      await api("PUT", "/restaurant_details/updateMenuItem", admin, {
+        ...item,
+        item_price: "90",
+      })
+    ).status,
+    200,
+  );
+  assert.equal(
+    (
+      await api("PUT", "/restaurant_details/updateMenuCategoryName", admin, {
+        id: "crud-cat",
+        menu_category_name: "Morning",
+        restaurant_id: r,
+      })
+    ).status,
+    200,
+  );
+  assert.equal(
+    (
+      await api("POST", "/restaurant_details/addAreas", admin, [
+        { area_id: "crud-area", area_name: "Patio", restaurant_id: r },
+      ])
+    ).status,
+    201,
+  );
+  const table = {
+    table_id: "crud-table",
+    table_name: "Patio 1",
+    table_capacity: 4,
+    table_status: "true",
+    restaurant_id: r,
+    area_id: "crud-area",
+  };
+  assert.equal(
+    (await api("POST", "/restaurant_details/addTable", admin, [table])).status,
+    201,
+  );
+  assert.equal(
+    (
+      await api("PUT", "/restaurant_details/updateTable", admin, {
+        ...table,
+        table_capacity: 6,
+      })
+    ).status,
+    200,
+  );
+  const staff = {
+    staff_id: "crud-waiter",
+    staff_name: "New waiter",
+    restaurant_id: r,
+    staff_email: "new@test.invalid",
+    staff_phone: "000000",
+    staff_role: "Waiter",
+    staff_status: "active",
+    staff_salary: "",
+    staff_shift_timing: "",
+    staff_address: "",
+    staff_image: "",
+    password: "testpass123",
+  };
+  assert.equal(
+    (await api("POST", "/restaurant_details/addStaff", admin, staff)).status,
+    201,
+  );
+  assert.equal(
+    (
+      await api("PUT", "/restaurant_details/updateStaff", admin, {
+        ...staff,
+        staff_name: "Renamed waiter",
+        password: "",
+      })
+    ).status,
+    200,
+  );
+  assert.equal(
+    (
+      await api("PUT", "/workspace/profile", admin, {
+        name: "Owner",
+        restaurentname: "Test One",
+        phonenumber: "1",
+        branchname: "Main",
+        branchaddress: "Test Street",
+      })
+    ).status,
+    200,
+  );
+  assert.equal(
+    (await api("DELETE", `/deleteTable/crud-table/${r}`, admin)).status,
+    200,
+  );
+});
+test("guest requests can be assigned and completed through the new workspace", async () => {
+  const request = await api("POST", "/createWaiterRequest", guest, {
+    id: "service-request",
+    restaurant_id: "r1",
+    table_id: "t1",
+    table_name: "T1",
+    request_type: "bill",
+  });
+  assert.equal(request.status, 201);
+  const mine = await api("GET", "/guest/requests", guest);
+  assert.equal(mine.status, 200);
+  assert.ok(mine.body.requests.some((r) => r.id === "service-request"));
+  assert.equal(
+    (
+      await api("PUT", "/assignWaiterToRequest/service-request", admin, {
+        waiter_id: "w1",
+      })
+    ).status,
+    200,
+  );
+  const workspace = await api("GET", "/workspace", waiter);
+  assert.ok(workspace.body.requests.some((r) => r.id === "service-request"));
+  assert.equal(
+    (await api("PUT", "/completeWaiterRequest/service-request", waiter, {}))
+      .status,
+    200,
+  );
+  assert.equal(
+    (await api("GET", "/guest/requests", guest)).body.requests.length,
+    0,
+  );
+});
+test("a busy waiter returns requests to the queue and cannot delete order history", async () => {
+  await db.query(
+    "UPDATE restaurant_staff SET status='inactive' WHERE id<>'w1' AND restaurant_id='r1' AND lower(role) LIKE '%waiter%'",
+  );
+  assert.equal(
+    (
+      await api("POST", "/createWaiterRequest", guest, {
+        id: "break-request",
+        restaurant_id: "r1",
+        table_id: "t1",
+        request_type: "assistance",
+      })
+    ).status,
+    201,
+  );
+  assert.equal(
+    (
+      await api("PUT", "/assignWaiterToRequest/break-request", admin, {
+        waiter_id: "w1",
+      })
+    ).status,
+    200,
+  );
+  assert.equal(
+    (await api("PUT", "/updateWaiterStatus/w1", waiter, { status: "busy" }))
+      .status,
+    200,
+  );
+  const queued = (
+    await db.query(
+      "SELECT status,assigned_waiter_id FROM waiter_requests WHERE id='break-request'",
+    )
+  ).rows[0];
+  assert.equal(queued.status, "pending");
+  assert.equal(queued.assigned_waiter_id, null);
+  assert.equal(
+    (await api("PUT", "/updateWaiterStatus/w1", waiter, { status: "invalid" }))
+      .status,
+    400,
+  );
+  assert.equal(
+    (
+      await api("PUT", "/updateWaiterStatus/w1", waiter, {
+        status: "available",
+      })
+    ).status,
+    200,
+  );
+  assert.equal(
+    (await api("DELETE", "/restaurant_details/deleteStaff/w1/r1", admin))
+      .status,
+    409,
+  );
 });

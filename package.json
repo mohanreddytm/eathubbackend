@@ -18,7 +18,11 @@
   "main": "app.js",
   "scripts": {
     "start": "node app.js",
-    "test": "node --test test/*.test.js"
+    "test": "node --test test/*.test.js",
+    "dev": "nodemon app.js",
+    "db:check": "node scripts/database.js",
+    "db:migrate": "node scripts/database.js --migrate",
+    "demo": "node scripts/demo.js"
   },
   "keywords": [],
   "author": "",
