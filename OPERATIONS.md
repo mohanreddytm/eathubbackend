@@ -9,7 +9,7 @@ Use Node 20 or later. From the AK47 root, run `npm run setup`. This installs bot
 1. Put your Neon connection string in `backend/eathubbackend/.env` as `DATABASE_URL`. Keep the SSL parameters supplied by Neon. Never commit or send the connection string in chat.
 2. Check that `JWT_SECRET` has at least 32 random bytes. To generate it separately: `node -e "console.log(require('crypto').randomBytes(48).toString('hex'))"`.
 3. Back up the database. Run `migrations/preflight.sql` in your SQL console and resolve invalid monetary amounts, orphan references and duplicate successful payments. Verify historical UPI/payment receipts against your records before reconciling them.
-4. From the AK47 root run `npm run db:migrate`, then `npm run db:check`. From this backend folder the same script names work. Migration **002** handles both the supplied legacy schema and databases that already ran migration 001. Do not run 001 separately for this release.
+4. From the AK47 root run `npm run db:migrate`, then `npm run db:check`. From this backend folder the same script names work. Pending migrations **002 and 003** run together. Migration **002** handles both the supplied legacy schema and databases that already ran migration 001. Do not run 001 separately for this release.
 5. Run `npm run dev` from the root to start the backend and frontend together. The frontend uses `http://localhost:8000` locally. Set `REACT_APP_API_BASE_URL` explicitly if you change the backend address, and restart React.
 6. Sign in again; legacy tokens are intentionally incompatible with the repaired authorization rules.
 
@@ -52,7 +52,7 @@ The UI shows **Pay online · TEST** only when configured. The server creates the
 
 Reference: [Razorpay Standard Checkout integration](https://razorpay.com/docs/payments/payment-gateway/web-integration/standard/integration-steps/).
 
-No live-money checkout, refunds, marketplace settlement across restaurants, or automated reconciliation is enabled. Real provider credentials and webhook delivery must be tested in your merchant test account before enabling a public environment. Provider calls in this release's automated suite are mocked; no money was transferred.
+Full and item-based partial test refunds are available for completed Razorpay-paid orders; see [refund setup, API and tests](REFUNDS.md). No live-money checkout, marketplace settlement across restaurants, or automated reconciliation is enabled. Real provider credentials and webhook delivery must be tested in your merchant test account before enabling a public environment. Provider calls in this release's automated suite are mocked; no money was transferred.
 
 ## Hosting and verification
 
@@ -60,6 +60,6 @@ Use `NODE_ENV=production`, a strong rotated JWT secret, your database URL, `REST
 
 If credentials from an earlier commit have not yet been rotated, rotate them in Neon/hosting settings. Removing a secret from the latest code does not remove it from Git history. Reset any previous default super-admin password with `reset_super_admin_password.js`, setting `SUPER_ADMIN_EMAIL` and a new `SUPER_ADMIN_PASSWORD` temporarily. The public initialization API remains removed.
 
-`npm test` runs 19 API/migration/payment regressions against disposable PGlite fixtures. The frontend adds URL and receipt tests and a browser smoke workflow. Embedded PostgreSQL serializes connections; test real multi-connection load, your full historical Neon data, your actual printer and provider test account separately. Rate limits use process-local memory; a horizontally scaled deployment needs a shared limiter or host-level limits.
+`npm test` runs 32 API/migration/payment/refund regressions against disposable PGlite fixtures. The frontend adds URL and receipt tests and a browser smoke workflow. Embedded PostgreSQL serializes connections; test real multi-connection load, your full historical Neon data, your actual printer and provider test account separately. Rate limits use process-local memory; a horizontally scaled deployment needs a shared limiter or host-level limits.
 
 If migration fails, the transaction rolls back. Resolve the reported data issue and rerun. After migration, keep the paired release: the old backend's integer-numbering query is incompatible with text order numbers. Do not silently restore old credentials or mark historical payment rows successful.

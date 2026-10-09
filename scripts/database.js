@@ -1,6 +1,6 @@
 const path = require("path");
 require("dotenv").config({ path: path.join(__dirname, "../.env") });
-const fs = require("fs");
+const { applyPendingMigrations } = require("../lib/migrations");
 const { Pool } = require("pg");
 const { checkDatabase } = require("../lib/readiness");
 async function main() {
@@ -16,12 +16,8 @@ async function main() {
       try {
         await c.query("BEGIN");
         await c.query("SELECT pg_advisory_xact_lock(74147002)");
-        await c.query(
-          fs.readFileSync(
-            path.join(__dirname, "../migrations/002_schema_compatibility.sql"),
-            "utf8",
-          ),
-        );
+        await applyPendingMigrations(c);
+        await checkDatabase(c);
         await c.query("COMMIT");
       } catch (e) {
         await c.query("ROLLBACK");

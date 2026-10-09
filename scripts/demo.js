@@ -14,12 +14,7 @@ async function main() {
   await db.exec(
     fs.readFileSync(path.join(__dirname, "../test/schema.sql"), "utf8"),
   );
-  await db.exec(
-    fs.readFileSync(
-      path.join(__dirname, "../migrations/002_schema_compatibility.sql"),
-      "utf8",
-    ),
-  );
+  await require("../lib/migrations").applyPendingMigrations(db);
   const hash = await require("bcrypt").hash("EatHubDemo123!", 10);
   await db.query(
     "INSERT INTO restaurant_admin(id,name,email,password,restaurentname,phonenumber,branchname,country,branchaddress,payment_settings) VALUES('demo','Demo owner','admin@demo.invalid',$1,'Olive & Ember','0000000000','Garden branch','India','Demo address', '{\"taxRate\":5,\"paymentMethods\":{\"cash\":true,\"upi\":true,\"card\":true}}')",
