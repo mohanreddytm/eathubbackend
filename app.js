@@ -373,7 +373,7 @@ app.get('/getOrdersKitchen/:restaurant_id',authorize('/getOrdersKitchen/:restaur
         const query = `
             SELECT * FROM orders 
             WHERE restaurant_id = $1 
-            AND order_status IN ('KOT', 'Preparing', 'Ready') AND status NOT IN ('Completed','Cancelled')
+            AND order_status IN ('KOT', 'Preparing', 'Ready') AND status NOT IN ('Completed','Cancelled','Refunded')
             ORDER BY created_at ASC;
         `;
         const result = await pool.query(query, [restaurant_id]);
@@ -1910,7 +1910,8 @@ app.get('/getReservations/:restaurant_id',authorize('/getReservations/:restauran
 
 // Add a new reservation
 const commerce=require('./lib/commerce').registerCommerce(app,pool,security);
-require('./lib/gateway').registerGateway(app,pool,security,commerce.settle);
+const refunds = require('./lib/refunds').registerRefunds(app,pool,security);
+require('./lib/gateway').registerGateway(app,pool,security,commerce.settle,undefined,refunds.handleWebhook);
 require('./lib/workspace')(app,pool,security);
 require('./lib/deletions')(app,pool,security);
 app.use((error,req,res,next)=>{if(res.headersSent)return next(error);return sendError(error,req,res);});

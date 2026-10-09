@@ -17,6 +17,7 @@ test("integer order numbers upgrade without losing history; reruns preserve the 
     );
     await assert.rejects(() => checkDatabase(db), /Database upgrade required/);
     await db.exec("BEGIN;" + upgrade + "COMMIT;");
+    await require("../lib/migrations").applyPendingMigrations(db);
     await checkDatabase(db);
     let o = (await db.query("SELECT * FROM orders WHERE id='old'")).rows[0];
     assert.equal(o.order_number, "7");
@@ -60,6 +61,7 @@ test("a database that ran audit migration 001 also upgrades safely", async () =>
       ),
     );
     await db.exec("BEGIN;" + upgrade + "COMMIT;");
+    await require("../lib/migrations").applyPendingMigrations(db);
     await checkDatabase(db);
     assert.equal(
       (await db.query("SELECT version FROM eathub_schema_versions")).rows[0]
